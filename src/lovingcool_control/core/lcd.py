@@ -30,7 +30,7 @@ from collections.abc import Callable, Iterable, Iterator
 from importlib.util import find_spec
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageSequence
+from PIL import Image, ImageDraw, ImageFont
 
 from .device import AIODevice, DeviceError
 
@@ -40,45 +40,12 @@ CV2_AVAILABLE = find_spec("cv2") is not None
 
 log = logging.getLogger(__name__)
 
-VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".avi")
 
 Frame = tuple[Image.Image, int]   # (image, duration_ms)
 
 
-# ──────────────────────────────────────────────────────────────
-#  Encoding
-# ──────────────────────────────────────────────────────────────
-
-def _rgb_array(img: Image.Image):
-    import numpy as np  # only the (legacy) raw-pixel formats need it
-
-    return np.asarray(img.convert("RGB"), dtype=np.uint16)
-
-
-def image_to_rgb565(img: Image.Image) -> bytes:
-    """RGB565, little-endian."""
-    a = _rgb_array(img)
-    v = ((a[..., 0] >> 3) << 11) | ((a[..., 1] >> 2) << 5) | (a[..., 2] >> 3)
-    return v.astype("<u2").tobytes()
-
-
-def image_to_bgr565(img: Image.Image) -> bytes:
-    """BGR565, little-endian (red and blue swapped)."""
-    a = _rgb_array(img)
-    v = ((a[..., 2] >> 3) << 11) | ((a[..., 1] >> 2) << 5) | (a[..., 0] >> 3)
-    return v.astype("<u2").tobytes()
-
-
-def image_to_rgb888(img: Image.Image) -> bytes:
-    return img.convert("RGB").tobytes()
-
-
-FORMAT_ENCODERS = {
-    "RGB565": image_to_rgb565,
-    "BGR565": image_to_bgr565,
-    "RGB888": image_to_rgb888,
-}
-
+# ── Encoding ──────────────────────────────────────────────────
 
 def fit_jpeg(img: Image.Image, max_size_kb: float, hint: int | None = None) -> tuple[bytes, int]:
     """
@@ -130,18 +97,22 @@ def encode_jpeg_capped(img: Image.Image, max_size_kb: float) -> bytes:
     return fit_jpeg(img, max_size_kb)[0]
 
 
-# ──────────────────────────────────────────────────────────────
-#  Sources: images, GIFs, video, text
-# ──────────────────────────────────────────────────────────────
+# ── Sources: images, GIFs, video, text ────────────────────────
 
 def load_image(path: str | Path) -> Image.Image:
-    return Image.open(path)
+    with Image.open(path) as source:
+        source.load()
+        return source.copy()
 
 
 def load_gif_frames(path: str | Path) -> list[Frame]:
-    """All frames of a GIF as (frame, duration_ms)."""
-    gif = Image.open(path)
-    return [(frame.copy(), frame.info.get("duration", 100)) for frame in ImageSequence.Iterator(gif)]
+    """Every frame of a GIF with its delay in ms (100 ms when the file doesn't say)."""
+    frames = []
+    with Image.open(path) as gif:
+        for index in range(getattr(gif, "n_frames", 1)):
+            gif.seek(index)
+            frames.append((gif.convert("RGBA"), int(gif.info.get("duration") or 100)))
+    return frames
 
 
 def _require_cv2(purpose: str):
@@ -213,34 +184,26 @@ def render_text_image(
     bg_color: tuple = (0, 0, 0),
     font_path: str | None = None,
 ) -> Image.Image:
-    """Render centred text onto a blank image."""
-    img = Image.new("RGB", (width, height), bg_color)
-    draw = ImageDraw.Draw(img)
+    """A width x height image with text centred on a solid background."""
     try:
-        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default(font_size)
-    except Exception:
-        font = ImageFont.load_default()
-    bbox = draw.textbbox((0, 0), text, font=font)
-    x = (width - (bbox[2] - bbox[0])) // 2 - bbox[0]
-    y = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
-    draw.text((x, y), text, fill=fg_color, font=font)
-    return img
+        face = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default(size=font_size)
+    except (OSError, TypeError):
+        face = ImageFont.load_default()
+    canvas = Image.new("RGB", (width, height), tuple(bg_color))
+    ImageDraw.Draw(canvas).text((width / 2, height / 2), text, fill=tuple(fg_color), font=face, anchor="mm")
+    return canvas
 
 
-# ──────────────────────────────────────────────────────────────
-#  Orientation (landscape/portrait), shared with core/canvas.py
-# ──────────────────────────────────────────────────────────────
+# ── Orientation (landscape/portrait), shared with core/canvas.py ───
 
 def logical_canvas_size(device_width: int, device_height: int, orientation: str) -> tuple[int, int]:
     """
-    The panel's raster is fixed (device_width x device_height). "Portrait"
-    means content is composed on a swapped-aspect canvas and the finished
-    frame is rotated 90 degrees into the native buffer at send time (see
-    orient_for_device). Editors and previews work at this logical size.
+    The size content is composed at. The panel's raster never changes;
+    portrait content is drawn on a swapped-aspect canvas and turned 90° into
+    the raster when sent (orient_for_device).
     """
-    if orientation == "portrait":
-        return device_height, device_width
-    return device_width, device_height
+    swap = orientation == "portrait"
+    return (device_height, device_width) if swap else (device_width, device_height)
 
 
 def orient_for_device(
@@ -250,17 +213,15 @@ def orient_for_device(
     orientation: str,
     fill_color: tuple[int, int, int] = (0, 0, 0),
 ) -> Image.Image:
-    """Turn a frame composed at the logical size into one at the native raster size."""
+    """Turn a logical-canvas frame into one at the panel's native raster size."""
+    frame = composed
     if orientation == "portrait":
-        composed = composed.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=fill_color)
-    if composed.size != (device_width, device_height):
-        composed = composed.resize((device_width, device_height), Image.LANCZOS)
-    return composed
+        frame = frame.transpose(Image.Transpose.ROTATE_90)
+    target = (device_width, device_height)
+    return frame if frame.size == target else frame.resize(target, Image.LANCZOS)
 
 
-# ──────────────────────────────────────────────────────────────
-#  Controller
-# ──────────────────────────────────────────────────────────────
+# ── Controller ────────────────────────────────────────────────
 
 class LCDController:
     """
@@ -274,7 +235,7 @@ class LCDController:
     that has never been verified on hardware.
     """
 
-    DEFAULT_MAX_JPEG_KB = 50   # vendor default for firmware <= 2.8
+    JPEG_BUDGET_KB = 50   # vendor default for firmware <= 2.8
 
     _instances: weakref.WeakKeyDictionary[AIODevice, LCDController] = weakref.WeakKeyDictionary()
     _instances_lock = threading.Lock()
@@ -289,10 +250,10 @@ class LCDController:
 
     def __init__(self, device: AIODevice):
         self.device = device
-        self._color_format = device.spec.lcd_color_format
-        self._live_started = False
+        self._format = device.spec.lcd_color_format
+        self._streaming = False
         self._use_frame_wrapper = False   # set by refresh_info() for firmware > 2.8
-        self._max_jpeg_kb = self.DEFAULT_MAX_JPEG_KB
+        self._jpeg_budget_kb = self.JPEG_BUDGET_KB
         self._jpeg_quality_hint: int | None = None
         self._info_loaded = False
         # Keep-alive: last frame as sent on the wire, and when anything was last sent.
@@ -318,7 +279,7 @@ class LCDController:
         info = {}
         if self.device.spec.transport == "serial":
             with self.device.exclusive():
-                was_live = self._live_started
+                was_live = self._streaming
                 self._end_stream()
                 try:
                     info = self.device.get_info()
@@ -338,21 +299,21 @@ class LCDController:
 
     # ── Low-level sending ─────────────────────────────────────
 
-    def _build_jpeg_frame(self, jpeg_bytes: bytes) -> bytes:
+    def _wrap_jpeg(self, jpeg_bytes: bytes) -> bytes:
         if not self._use_frame_wrapper:
             return jpeg_bytes
         body = len(jpeg_bytes).to_bytes(4, "little") + jpeg_bytes
         return body + (sum(body) & 0xFFFF).to_bytes(2, "little")
 
-    def send_raw_jpeg_frame(self, jpeg_bytes: bytes) -> None:
+    def send_jpeg(self, jpeg_bytes: bytes) -> None:
         """Send one already-encoded JPEG (commit first if this live session hasn't)."""
-        self._send_wire(self._build_jpeg_frame(jpeg_bytes))
+        self._send_wire(self._wrap_jpeg(jpeg_bytes))
 
     def _send_wire(self, wire: bytes) -> None:
         with self.device.exclusive():
-            if not self._live_started:
+            if not self._streaming:
                 self.device.send_command(self.device.spec.cmd_commit, expect_response=False)
-                self._live_started = True
+                self._streaming = True
             self.device.send_packet(wire)
             self._last_wire = wire
             self._last_send = time.monotonic()
@@ -378,7 +339,7 @@ class LCDController:
         period = self.device.spec.keepalive_ms / 1000.0
         while not stop.wait(period / 4):
             with self.device.exclusive():
-                if not self._live_started or self._last_wire is None or not self.device.connected:
+                if not self._streaming or self._last_wire is None or not self.device.connected:
                     return
                 if time.monotonic() - self._last_send < period:
                     continue
@@ -389,16 +350,6 @@ class LCDController:
                     return
                 self._last_send = time.monotonic()
 
-    def send_raw_frame(self, pixel_data: bytes) -> None:
-        """Legacy chunked raw-pixel transmission (unverified; see class docstring)."""
-        spec = self.device.spec
-        chunk_size = 60
-        with self.device.exclusive():
-            self.device.send_packet(bytes([spec.cmd_commit, 0x00] + [0x00] * 62))
-            for seq, offset in enumerate(range(0, len(pixel_data), chunk_size)):
-                header = bytes([spec.cmd_commit, (seq >> 8) & 0xFF, seq & 0xFF, 0x00])
-                self.device.send_packet((header + pixel_data[offset:offset + chunk_size]).ljust(64, b"\0"))
-
     def stop(self) -> None:
         """End the live session (stops the keep-alive); the next frame re-sends the commit."""
         self._keepalive_stop.set()
@@ -407,10 +358,10 @@ class LCDController:
             self._last_wire = None
 
     def _end_stream(self) -> None:
-        if self._live_started and self._use_frame_wrapper and self.device.connected:
+        if self._streaming and self._use_frame_wrapper and self.device.connected:
             # The vendor app resets the image stream with a double JPEG EOI.
             self.device.send_packet(bytes([0xFF, 0xD9, 0xFF, 0xD9]))
-        self._live_started = False
+        self._streaming = False
 
     # ── Commands while streaming ──────────────────────────────
 
@@ -422,7 +373,7 @@ class LCDController:
         after ~0.5 s without frames, so this doesn't flicker).
         """
         with self.device.exclusive():
-            was_live = self._live_started
+            was_live = self._streaming
             self._end_stream()
             try:
                 return self.device.send_command(key, payload, expect_response=expect_response)
@@ -450,12 +401,10 @@ class LCDController:
 
     def send_frame(self, native: Image.Image) -> None:
         """Encode and send an image that is already at the native raster size."""
-        if self._color_format == "JPEG":
-            data, self._jpeg_quality_hint = fit_jpeg(native, self._max_jpeg_kb, self._jpeg_quality_hint)
-            self.send_raw_jpeg_frame(data)
-        else:
-            encoder = FORMAT_ENCODERS.get(self._color_format, image_to_rgb565)
-            self.send_raw_frame(encoder(native))
+        if self._format != "JPEG":
+            raise DeviceError(f"Only JPEG screens are supported (this device is set to {self._format})")
+        data, self._jpeg_quality_hint = fit_jpeg(native, self._jpeg_budget_kb, self._jpeg_quality_hint)
+        self.send_jpeg(data)
 
     def send_image(self, img: Image.Image, rotation: int = 0, orientation: str = "landscape") -> None:
         """Resize/orient a PIL image for the panel and send it."""

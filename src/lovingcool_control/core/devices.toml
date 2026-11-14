@@ -14,7 +14,7 @@
 #   dtr                assert DTR + DSR/DTR flow control on open [false]
 #   lcd_width/height   fallback panel size; the device's own get_info
 #                      reply wins once connected   [240 x 240]
-#   lcd_color_format   "JPEG" | "RGB565" | "BGR565" | "RGB888"  ["RGB565"]
+#   lcd_color_format   "JPEG" (the only format implemented)  ["JPEG"]
 #   packet_size, report_id, interface   HID only
 #   cmd_*              command-channel opcodes (see core/protocol.py)
 #   keepalive_ms       re-send the last frame this often while idle, for
@@ -71,4 +71,4 @@ verified = true
 #
 # RGB/fan lighting is a SEPARATE USB device on this product line (often a
 # CH340 USB-serial bridge, VID 0x1A86, or 0xA012 / 0xAA12) with a different
-# protocol; see core/rgb.py.
+# protocol, and isn't supported yet.

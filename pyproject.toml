@@ -10,7 +10,6 @@ dependencies = [
     "PyQt6>=6.6.0",
     "hidapi>=0.14.0",
     "Pillow>=10.1.0",
-    "numpy>=1.24",
     "pyserial>=3.5",
     "psutil>=5.9.0",
     "opencv-python-headless>=4.8.0",

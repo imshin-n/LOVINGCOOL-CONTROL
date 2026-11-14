@@ -108,13 +108,12 @@ class InfoPage(QWidget):
         self.candidates.clear()
         known = {(s.vid, s.pid) for s in KNOWN_DEVICES}
         try:
-            found = [c for c in find_any_cooler_candidates() if (c["vendor_id"], c["product_id"]) not in known]
+            found = [c for c in find_any_cooler_candidates() if (c.vendor_id, c.product_id) not in known]
         except Exception as e:
             self.candidates.addItem(f"USB scan failed: {e}")
             return
         for c in found:
-            self.candidates.addItem(f"{c['vendor_id']:04x}:{c['product_id']:04x}   "
-                                    f"{c.get('product_string') or '(unnamed)'}   "
-                                    f"{c.get('manufacturer_string') or ''}   [{c['_transport']}]")
+            self.candidates.addItem(f"{c.vendor_id:04x}:{c.product_id:04x}   {c.product or '(unnamed)'}   "
+                                    f"{c.manufacturer}   [{c.transport}]")
         if not found:
             self.candidates.addItem("Nothing else that looks like a cooler controller.")

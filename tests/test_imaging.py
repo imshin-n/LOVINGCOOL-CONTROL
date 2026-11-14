@@ -9,7 +9,6 @@ from PIL import Image
 
 from lovingcool_control.core.lcd import (
     encode_jpeg_capped,
-    image_to_rgb565,
     logical_canvas_size,
     orient_for_device,
 )
@@ -30,13 +29,6 @@ def test_jpeg_fits_under_cap_and_decodes():
 def test_jpeg_small_image_keeps_top_quality():
     flat = Image.new("RGB", (64, 64), (10, 20, 30))
     assert encode_jpeg_capped(flat, max_size_kb=50) == encode_jpeg_capped(flat, max_size_kb=10_000)
-
-
-def test_rgb565_little_endian():
-    img = Image.new("RGB", (2, 1))
-    img.putpixel((0, 0), (255, 0, 0))
-    img.putpixel((1, 0), (0, 0, 255))
-    assert image_to_rgb565(img) == bytes([0x00, 0xF8, 0x1F, 0x00])
 
 
 @pytest.mark.parametrize(
@@ -62,13 +54,6 @@ def test_portrait_rotates_content_into_native_buffer():
     assert out.getpixel((0, 319)) == (255, 255, 255)
 
 
-def test_bgr565_swaps_red_and_blue():
-    from lovingcool_control.core.lcd import image_to_bgr565
-
-    img = Image.new("RGB", (1, 1), (255, 0, 0))
-    assert image_to_bgr565(img) == bytes([0x1F, 0x00])
-
-
 @pytest.mark.parametrize("hint", [None, 1, 20, 55, 90, 100])
 def test_fit_jpeg_hint_gives_same_answer(hint):
     from lovingcool_control.core.lcd import fit_jpeg
@@ -87,3 +72,22 @@ def test_fit_jpeg_returns_highest_fitting_quality():
     over = io.BytesIO()
     img.save(over, format="JPEG", quality=q + 1)
     assert len(over.getvalue()) > 20 * 1024
+
+
+def test_non_jpeg_screens_are_rejected_clearly(make_device):
+    from lovingcool_control.core.device import DeviceError
+    from lovingcool_control.core.lcd import LCDController
+
+    d, _ = make_device(lcd_color_format="RGB565")
+    ctl = LCDController(d)
+    ctl._info_loaded = True
+    with pytest.raises(DeviceError, match="Only JPEG"):
+        ctl.send_image(Image.new("RGB", (10, 10)))
+
+
+def test_text_is_centred():
+    from lovingcool_control.core.lcd import render_text_image
+
+    img = render_text_image("X", 100, 100, font_size=40, fg_color=(255, 255, 255), bg_color=(0, 0, 0))
+    box = img.getbbox()
+    assert box and abs((box[0] + box[2]) / 2 - 50) <= 3 and abs((box[1] + box[3]) / 2 - 50) <= 3

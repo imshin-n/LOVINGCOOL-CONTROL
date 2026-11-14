@@ -22,17 +22,18 @@ hardware or an optional package doesn't provide it; nothing here raises.
 from __future__ import annotations
 
 import logging
-import platform
 import shutil
 import subprocess
+import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-IS_WINDOWS = platform.system() == "Windows"
+IS_WINDOWS = sys.platform == "win32"
 REFRESH_S = 1.0
 
 try:
@@ -44,11 +45,12 @@ except ImportError:
 # CPU temperature drivers, best first, with the sensor label to prefer in each.
 _CPU_HWMON = [("k10temp", ("tctl", "tdie")), ("zenpower", ("tdie", "tctl")),
               ("coretemp", ("package id 0",)), ("cpu_thermal", ()), ("acpitz", ())]
-_CPU_TEMP_HINTS = ["tctl", "package id 0", "cpu package", "tdie", "core 0", "cpu"]   # psutil fallback
+_CPU_TEMP_HINTS = ("tctl", "tdie", "package id 0", "cpu package", "core 0", "cpu")   # psutil fallback, best first
 
 
 @dataclass
 class Metric:
+    """One stat: its key, how to label it, and the current value (None when unavailable)."""
     key: str
     label: str
     unit: str
@@ -57,27 +59,27 @@ class Metric:
 
     @property
     def display(self) -> str:
-        if not self.available or self.value is None:
+        """The value as shown on screen: whole numbers plus unit, or "N/A"."""
+        if self.value is None or not self.available:
             return "N/A"
-        if isinstance(self.value, float):
-            return f"{self.value:.0f}{self.unit}"
-        return f"{self.value}{self.unit}"
+        text = f"{round(self.value)}" if isinstance(self.value, float) else str(self.value)
+        return text + self.unit
 
 
 METRIC_CHOICES = [
-    ("clock", "Clock (HH:MM:SS)"),
+    ("clock", "Time"),
     ("date", "Date"),
-    ("cpu_percent", "CPU Usage %"),
-    ("cpu_temp", "CPU Temperature"),
-    ("cpu_freq", "CPU Frequency"),
-    ("ram_percent", "RAM Usage %"),
-    ("disk_percent", "Disk Usage %"),
-    ("gpu_percent", "GPU Usage %"),
-    ("gpu_temp", "GPU Temperature"),
-    ("battery_percent", "Battery %"),
-    ("net_sent", "Network Sent (total)"),
-    ("net_recv", "Network Received (total)"),
-    ("uptime", "System Uptime"),
+    ("cpu_percent", "CPU load"),
+    ("cpu_temp", "CPU temperature"),
+    ("cpu_freq", "CPU clock speed"),
+    ("ram_percent", "Memory in use"),
+    ("disk_percent", "Disk space used"),
+    ("gpu_percent", "GPU load"),
+    ("gpu_temp", "GPU temperature"),
+    ("battery_percent", "Battery level"),
+    ("net_sent", "Data sent since boot"),
+    ("net_recv", "Data received since boot"),
+    ("uptime", "Time since boot"),
 ]
 ALL_KEYS = frozenset(k for k, _ in METRIC_CHOICES)
 
@@ -189,12 +191,12 @@ class Sensors:
                 temps = psutil.sensors_temperatures()
             except Exception:
                 return None
-            candidates = [e for entries in temps.values() for e in entries if e.current]
-            for hint in _CPU_TEMP_HINTS:
-                for e in candidates:
-                    if hint in (e.label or "").lower():
-                        return e.current
-            return candidates[0].current if candidates else None
+            readings = [(r.label or "").lower() for group in temps.values() for r in group if r.current]
+            values = [r.current for group in temps.values() for r in group if r.current]
+            best = min(range(len(readings)), default=None,
+                       key=lambda i: next((rank for rank, word in enumerate(_CPU_TEMP_HINTS) if word in readings[i]),
+                                          len(_CPU_TEMP_HINTS)))
+            return values[best] if best is not None else None
         return None
 
     def _gpu(self) -> tuple[float | None, float | None]:
@@ -257,8 +259,8 @@ class Sensors:
             return self._cache[key][1]
         if key in ("net_sent", "net_recv"):
             def net():
-                io = psutil.net_io_counters()
-                return io.bytes_sent / 1e9, io.bytes_recv / 1e9
+                totals = psutil.net_io_counters()
+                return totals.bytes_sent / 1e9, totals.bytes_recv / 1e9
             self._pair("net_sent", "net_recv", net if PSUTIL_AVAILABLE else (lambda: (None, None)))
             return self._cache[key][1]
         now = time.monotonic()
@@ -308,18 +310,17 @@ def read_all(keys=None) -> dict[str, Metric]:
 
 
 class CpuHistory:
-    """Rolling CPU% history for the graph widget: one point per stats refresh (~1 min of history)."""
+    """Recent CPU load values for the graph widget: one per stats refresh, about a minute's worth."""
 
     def __init__(self, max_points: int = 60):
         self.max_points = max_points
-        self._values: list[float] = []
-        self._last_sample = 0.0
+        self._points: deque[float] = deque(maxlen=max_points)
+        self._last = float("-inf")
 
     def sample(self, cpu_percent: float | None) -> list[float]:
+        """Record a value if a refresh interval has passed; return the history, oldest first."""
         now = time.monotonic()
-        if cpu_percent is not None and now - self._last_sample >= REFRESH_S * 0.95:
-            self._values.append(cpu_percent)
-            if len(self._values) > self.max_points:
-                self._values.pop(0)
-            self._last_sample = now
-        return list(self._values)
+        if cpu_percent is not None and now - self._last >= REFRESH_S * 0.95:
+            self._points.append(float(cpu_percent))
+            self._last = now
+        return list(self._points)

@@ -12,7 +12,6 @@ url="https://github.com/imshin-n/LOVINGCOOL-CONTROL"
 license=('MIT')
 depends=(
   'python'
-  'python-numpy'
   'python-opencv'
   'python-pillow'
   'python-psutil'
