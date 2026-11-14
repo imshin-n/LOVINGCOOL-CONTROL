@@ -178,7 +178,7 @@ def test_designer_reopens_autosaved_work(env):
     try:
         assert [x.text for x in w2.designer._widgets] == ["keep me"]
         assert w2.designer._orientation == "portrait"
-        assert w2.designer.btn_portrait.isChecked()
+        assert w2.designer.orientation.currentData() == "portrait"
     finally:
         w2.close()
 

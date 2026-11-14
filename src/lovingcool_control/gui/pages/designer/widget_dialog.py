@@ -1,4 +1,4 @@
-"""Dialog for adding or editing one overlay widget (text, hardware stat, CPU graph)."""
+"""Add / edit one scene widget: what it shows, where, and how it looks."""
 
 from __future__ import annotations
 
@@ -11,155 +11,139 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from lovingcool_control.core import sensors
 from lovingcool_control.core.canvas import Widget
 
-WIDGET_KIND_LABELS = {"text": "Custom Text", "stat": "Hardware Stat", "cpu_graph": "CPU Graph (sparkline)"}
+KINDS = [("stat", "System stat"), ("text", "Text"), ("cpu_graph", "CPU graph")]
+METRIC_NAMES = dict(sensors.METRIC_CHOICES)
 
 
-class AddWidgetDialog(QDialog):
-    """Form for configuring one overlay widget. Position can be left at default
-    and then dragged into place afterward in the preview."""
+def describe_widget(w: Widget) -> str:
+    """One line for the designer's widget list."""
+    at = f"({w.x}, {w.y})"
+    if w.kind == "text":
+        return f'Text "{w.text}"  {at}'
+    if w.kind == "stat":
+        return f"{METRIC_NAMES.get(w.metric_key, w.metric_key)}  {at}"
+    if w.kind == "cpu_graph":
+        return f"CPU graph {w.width}×{w.height}  {at}"
+    return f"{w.kind}  {at}"
 
+
+def _spin(lo: int, hi: int, value: int, suffix: str = "") -> QSpinBox:
+    s = QSpinBox()
+    s.setRange(lo, hi)
+    s.setValue(value)
+    if suffix:
+        s.setSuffix(suffix)
+    return s
+
+
+class WidgetDialog(QDialog):
     def __init__(self, parent=None, initial: Widget | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Widget")
-        self.setMinimumWidth(320)
+        self.setWindowTitle("Edit widget" if initial else "Add widget")
+        self.setMinimumWidth(340)
+        start = initial or Widget(kind="stat")
+        self._color = QColor(*start.color)
 
-        form = QFormLayout(self)
+        outer = QVBoxLayout(self)
+        top = QFormLayout()
+        self.kind = QComboBox()
+        for key, label in KINDS:
+            self.kind.addItem(label, key)
+        top.addRow("Type:", self.kind)
+        outer.addLayout(top)
 
-        self.kind_combo = QComboBox()
-        for key, label in WIDGET_KIND_LABELS.items():
-            self.kind_combo.addItem(label, key)
-        self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
-        form.addRow("Type", self.kind_combo)
-
-        self.text_field = QLineEdit()
-        self.text_field.setPlaceholderText("Text to display")
-        form.addRow("Text", self.text_field)
-
-        self.metric_combo = QComboBox()
+        # One page of options per kind
+        self.pages = QStackedWidget()
+        stat_page, stat_form = self._page()
+        self.metric = QComboBox()
         for key, label in sensors.METRIC_CHOICES:
-            self.metric_combo.addItem(label, key)
-        form.addRow("Metric", self.metric_combo)
+            self.metric.addItem(label, key)
+        self.metric.setCurrentIndex(max(0, self.metric.findData(start.metric_key)))
+        self.show_label = QCheckBox('Prefix with its name ("CPU: 42%")')
+        self.show_label.setChecked(start.show_label)
+        stat_form.addRow("Shows:", self.metric)
+        stat_form.addRow("", self.show_label)
 
-        self.show_label_check = QCheckBox("Show label (e.g. \"CPU: 42%\" vs \"42%\")")
-        self.show_label_check.setChecked(True)
-        form.addRow("", self.show_label_check)
+        text_page, text_form = self._page()
+        self.text = QLineEdit(start.text)
+        self.text.setPlaceholderText("Text to show")
+        text_form.addRow("Text:", self.text)
 
-        self.x_spin = QSpinBox()
-        self.x_spin.setRange(0, 4000)
-        self.x_spin.setValue(10)
-        self.y_spin = QSpinBox()
-        self.y_spin.setRange(0, 4000)
-        self.y_spin.setValue(10)
-        pos_row = QHBoxLayout()
-        pos_row.addWidget(self.x_spin)
-        pos_row.addWidget(QLabel("x"))
-        pos_row.addWidget(self.y_spin)
-        form.addRow("Position (X, Y)", pos_row)
-        hint = QLabel("Tip: drag the widget directly in the preview afterward.")
-        hint.setObjectName("pageSubtitle")
-        form.addRow("", hint)
-
-        self.font_size_spin = QSpinBox()
-        self.font_size_spin.setRange(6, 200)
-        self.font_size_spin.setValue(28)
-        form.addRow("Font size", self.font_size_spin)
-
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(20, 2000)
-        self.width_spin.setValue(140)
-        self.height_spin = QSpinBox()
-        self.height_spin.setRange(20, 2000)
-        self.height_spin.setValue(48)
+        graph_page, graph_form = self._page()
+        self.graph_w = _spin(20, 2000, start.width, " px")
+        self.graph_h = _spin(20, 2000, start.height, " px")
         size_row = QHBoxLayout()
-        size_row.addWidget(self.width_spin)
-        size_row.addWidget(QLabel("x"))
-        size_row.addWidget(self.height_spin)
-        form.addRow("Graph size (W, H)", size_row)
+        size_row.addWidget(self.graph_w)
+        size_row.addWidget(self.graph_h)
+        graph_form.addRow("Size (W × H):", size_row)
 
-        self._color = QColor(255, 255, 255)
+        for page in (stat_page, text_page, graph_page):
+            self.pages.addWidget(page)
+        outer.addWidget(self.pages)
+
+        common = QFormLayout()
+        self.x = _spin(0, 4000, start.x)
+        self.y = _spin(0, 4000, start.y)
+        pos = QHBoxLayout()
+        pos.addWidget(self.x)
+        pos.addWidget(self.y)
+        common.addRow("Position (X, Y):", pos)
+        self.font_size = _spin(6, 300, start.font_size, " px")
+        common.addRow("Text size:", self.font_size)
         self.color_btn = QPushButton()
-        self._update_color_btn()
-        self.color_btn.clicked.connect(self._pick_color)
-        form.addRow("Color", self.color_btn)
+        self.color_btn.clicked.connect(self._choose_color)
+        common.addRow("Colour:", self.color_btn)
+        outer.addLayout(common)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        outer.addWidget(buttons)
 
-        if initial is not None:
-            self._load_from(initial)
-        self._on_kind_changed()
+        self.kind.currentIndexChanged.connect(self.pages.setCurrentIndex)
+        self.kind.setCurrentIndex(max(0, self.kind.findData(start.kind)))
+        self.pages.setCurrentIndex(self.kind.currentIndex())
+        self._show_color()
 
-    def _load_from(self, w: Widget):
-        index = self.kind_combo.findData(w.kind)
-        if index >= 0:
-            self.kind_combo.setCurrentIndex(index)
-        self.text_field.setText(w.text)
-        metric_index = self.metric_combo.findData(w.metric_key)
-        if metric_index >= 0:
-            self.metric_combo.setCurrentIndex(metric_index)
-        self.show_label_check.setChecked(w.show_label)
-        self.x_spin.setValue(w.x)
-        self.y_spin.setValue(w.y)
-        self.font_size_spin.setValue(w.font_size)
-        self.width_spin.setValue(w.width)
-        self.height_spin.setValue(w.height)
-        self._color = QColor(*w.color)
-        self._update_color_btn()
+    @staticmethod
+    def _page() -> tuple[QWidget, QFormLayout]:
+        page = QWidget()
+        form = QFormLayout(page)
+        form.setContentsMargins(0, 0, 0, 0)
+        return page, form
 
-    def _update_color_btn(self):
-        self.color_btn.setStyleSheet(f"background-color: {self._color.name()};")
+    def _show_color(self) -> None:
+        ink = "#000" if self._color.lightness() > 140 else "#fff"
+        self.color_btn.setStyleSheet(f"background-color: {self._color.name()}; color: {ink};")
         self.color_btn.setText(self._color.name())
 
-    def _pick_color(self):
-        color = QColorDialog.getColor(self._color, self, "Widget Color")
-        if color.isValid():
-            self._color = color
-            self._update_color_btn()
-
-    def _on_kind_changed(self):
-        kind = self.kind_combo.currentData()
-        self.text_field.setVisible(kind == "text")
-        self.metric_combo.setVisible(kind == "stat")
-        self.show_label_check.setVisible(kind == "stat")
-        self.font_size_spin.setVisible(kind in ("text", "stat"))
-        is_graph = kind == "cpu_graph"
-        self.width_spin.setVisible(is_graph)
-        self.height_spin.setVisible(is_graph)
+    def _choose_color(self) -> None:
+        picked = QColorDialog.getColor(self._color, self, "Widget colour")
+        if picked.isValid():
+            self._color = picked
+            self._show_color()
 
     def to_widget(self) -> Widget:
-        kind = self.kind_combo.currentData()
-        color = (self._color.red(), self._color.green(), self._color.blue())
         return Widget(
-            kind=kind,
-            x=self.x_spin.value(),
-            y=self.y_spin.value(),
-            font_size=self.font_size_spin.value(),
-            color=color,
-            text=self.text_field.text(),
-            metric_key=self.metric_combo.currentData() or "cpu_percent",
-            show_label=self.show_label_check.isChecked(),
-            width=self.width_spin.value(),
-            height=self.height_spin.value(),
+            kind=self.kind.currentData(),
+            x=self.x.value(),
+            y=self.y.value(),
+            font_size=self.font_size.value(),
+            color=(self._color.red(), self._color.green(), self._color.blue()),
+            text=self.text.text(),
+            metric_key=self.metric.currentData() or "cpu_percent",
+            show_label=self.show_label.isChecked(),
+            width=self.graph_w.value(),
+            height=self.graph_h.value(),
         )
-
-
-def describe_widget(w: Widget) -> str:
-    if w.kind == "text":
-        return f"Text @ ({w.x},{w.y}): \"{w.text}\""
-    if w.kind == "stat":
-        label = dict(sensors.METRIC_CHOICES).get(w.metric_key, w.metric_key)
-        return f"Stat @ ({w.x},{w.y}): {label}"
-    if w.kind == "cpu_graph":
-        return f"CPU Graph @ ({w.x},{w.y}) {w.width}x{w.height}"
-    return w.kind

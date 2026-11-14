@@ -1,15 +1,13 @@
 """
 lovingcool-control :: gui/pages/designer/page.py
 ================================================
-Screen Designer: layer a background (colour, image, GIF or video) with live
-widgets (hardware stats, clock, text, a CPU graph), drag them into place,
-rotate the whole thing, save/load it as a scene file, and run it live.
+Screen Designer: put widgets (stats, text, a CPU graph) over a background
+(colour, image, GIF or video), drag them into place, and run it live.
 
-"Start Live" saves the scene to scenes/designer-live.json and asks the
-service to run it, so it keeps running after this window closes (with the
-background service). While live, edits are pushed to the screen as you
-make them. Your work in progress is autosaved to scenes/designer.json and
-reopened next time.
+- Start Live writes scenes/designer-live.json and asks the service to run
+  it, so it survives closing the window (with the background service).
+  While live, edits are pushed once they've settled for PUSH_SETTLE_S.
+- Work in progress is autosaved to scenes/designer.json and reopened.
 """
 
 from __future__ import annotations
@@ -23,17 +21,16 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QColorDialog,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
-    QFrame,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -56,16 +53,21 @@ from lovingcool_control.core.canvas import (
 )
 from lovingcool_control.core.device import user_config_dir
 from lovingcool_control.gui.bridge import ServiceBridge
+from lovingcool_control.gui.pages.device_view import ColorButton
 
 from .preview import ScenePreview
-from .widget_dialog import AddWidgetDialog, describe_widget
+from .widget_dialog import WidgetDialog, describe_widget
 
 log = logging.getLogger(__name__)
 
-FIT_MODES = [("cover", "Cover (crop to fill)"), ("contain", "Contain (letterbox)"),
-             ("stretch", "Stretch (distort)"), ("center", "Center (no scale)")]
-BG_KINDS = [("color", "Solid Color"), ("image", "Image"), ("gif", "GIF"), ("video", "Video")]
-PUSH_SETTLE_S = 0.4   # while live, push an edit once it has been stable this long
+PUSH_SETTLE_S = 0.4
+BACKGROUNDS = [("color", "Colour"), ("image", "Image"), ("gif", "GIF"), ("video", "Video")]
+FITS = [("cover", "Fill (crop)"), ("contain", "Fit (letterbox)"), ("stretch", "Stretch"), ("center", "Original size")]
+FILE_FILTERS = {
+    "image": "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
+    "gif": "GIF (*.gif)",
+    "video": "Video (*.mp4 *.avi *.mov *.mkv *.webm)",
+}
 
 
 def scenes_dir() -> Path:
@@ -80,451 +82,341 @@ def autosave_path() -> Path:
     return scenes_dir() / "designer.json"
 
 
+def _rgb(c: QColor) -> tuple[int, int, int]:
+    return c.red(), c.green(), c.blue()
+
+
 class ScreenDesignerPage(QWidget):
     log_message = pyqtSignal(str)
 
     def __init__(self, bridge: ServiceBridge):
         super().__init__()
         self.bridge = bridge
-        self._background_path: str | None = None
-        self._background_kind = "color"
-        self._fit_mode = "cover"
+        self._widgets = []                     # bound to the preview: dragging edits these in place
+        self._bg_path: str | None = None
         self._orientation = "landscape"
-        self._bg_color = QColor(14, 17, 20)
-        self._fill_color = QColor(14, 17, 20)
-        self._widgets = []
-        self._preview_history = sensors.CpuHistory()
-        # Live sync / autosave bookkeeping (compare scene dicts, not widgets)
+        self._history = sensors.CpuHistory()
+        self._preview_key = None
+        self._last_autosaved: dict | None = None
         self._last_pushed: dict | None = None
         self._pending: dict | None = None
         self._pending_since = 0.0
-        self._last_autosaved: dict | None = None
         self._push_in_flight = False
-        self._preview_key = None
 
-        self._build_ui()
+        self._build()
         self.preview.bind_widgets(self._widgets)
         self._restore_autosave()
 
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setInterval(200)
-        self._preview_timer.timeout.connect(self._tick)
-        self._preview_timer.start()
+        self._timer = QTimer(self, interval=200)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
         bridge.status_changed.connect(self._on_status)
 
-    # ── UI construction ──────────────────────────────────────
+    # ── Layout ────────────────────────────────────────────────
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+    def _build(self) -> None:
+        root = QHBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
 
-        content = QHBoxLayout()
-        content.setSpacing(12)
-
-        # Left: preview
-        preview_panel = QFrame()
-        preview_panel.setObjectName("panel")
-        preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(12, 12, 12, 12)
-        preview_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left = QVBoxLayout()
+        canvas_box = QGroupBox("Preview")
+        cl = QVBoxLayout(canvas_box)
         self.preview = ScenePreview()
-        self.preview.widget_moved.connect(self._on_widget_dragged)
-        self.preview.selection_changed.connect(self._on_preview_selection_changed)
+        self.preview.widget_moved.connect(self._on_dragged)
+        self.preview.selection_changed.connect(self._on_canvas_selection)
         self.preview.request_delete.connect(self._delete_widget_at)
-        preview_layout.addWidget(self.preview)
-
-        self.canvas_size_label = QLabel("Canvas: —")
-        self.canvas_size_label.setObjectName("pageSubtitle")
-        self.canvas_size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(self.canvas_size_label)
-
-        hint = QLabel("Click a widget to select, drag to move, Del to remove")
-        hint.setObjectName("pageSubtitle")
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(hint)
-
-        play_row = QHBoxLayout()
+        cl.addWidget(self.preview, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.canvas_label = QLabel()
+        self.canvas_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cl.addWidget(self.canvas_label)
+        tip = QLabel("Click a widget to select it, drag to move, Delete to remove.")
+        tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tip.setWordWrap(True)
+        cl.addWidget(tip)
+        live_row = QHBoxLayout()
         self.play_btn = QPushButton("Start Live")
-        self.play_btn.setObjectName("primaryButton")
         self.play_btn.setCheckable(True)
         self.play_btn.clicked.connect(self._toggle_live)
-        self.fps_spin = QSpinBox()
-        self.fps_spin.setRange(1, 30)
-        self.fps_spin.setValue(10)
-        self.fps_spin.setSuffix(" fps")
-        play_row.addWidget(self.play_btn)
-        play_row.addWidget(self.fps_spin)
-        preview_layout.addLayout(play_row)
+        self.fps = QSpinBox()
+        self.fps.setRange(1, 30)
+        self.fps.setValue(10)
+        self.fps.setSuffix(" fps")
+        live_row.addWidget(self.play_btn, stretch=1)
+        live_row.addWidget(self.fps)
+        cl.addLayout(live_row)
+        left.addWidget(canvas_box)
+        left.addStretch()
+        root.addLayout(left)
 
-        content.addWidget(preview_panel, stretch=0)
+        right = QVBoxLayout()
 
-        # Right: controls
-        controls_panel = QFrame()
-        controls_panel.setObjectName("panel")
-        controls_layout = QVBoxLayout(controls_panel)
-        controls_layout.setContentsMargins(12, 12, 12, 12)
-        controls_layout.setSpacing(14)
+        bg_box = QGroupBox("Background")
+        bf = QFormLayout(bg_box)
+        self.bg_kind = QComboBox()
+        for key, label in BACKGROUNDS:
+            self.bg_kind.addItem(label, key)
+        self.bg_kind.currentIndexChanged.connect(self._on_bg_kind)
+        bf.addRow("Type:", self.bg_kind)
+        file_row = QHBoxLayout()
+        self.bg_file = QLineEdit()
+        self.bg_file.setReadOnly(True)
+        self.bg_file.setPlaceholderText("No file selected")
+        self.bg_browse = QPushButton("Browse…")
+        self.bg_browse.clicked.connect(self._choose_bg_file)
+        file_row.addWidget(self.bg_file, stretch=1)
+        file_row.addWidget(self.bg_browse)
+        self.file_label = QLabel("File:")
+        bf.addRow(self.file_label, file_row)
+        self.fit = QComboBox()
+        for key, label in FITS:
+            self.fit.addItem(label, key)
+        self.fit.currentIndexChanged.connect(lambda _i: self._refresh_preview())
+        self.fit_label = QLabel("Fit:")
+        bf.addRow(self.fit_label, self.fit)
+        colors = QHBoxLayout()
+        self.bg_color = ColorButton(QColor(14, 17, 20), "Background colour")
+        self.fill_color = ColorButton(QColor(14, 17, 20), "Fill colour")
+        for b in (self.bg_color, self.fill_color):
+            b.changed.connect(lambda _c: self._refresh_preview())
+        colors.addWidget(QLabel("Colour"))
+        colors.addWidget(self.bg_color)
+        colors.addSpacing(12)
+        colors.addWidget(QLabel("Fill behind transparency"))
+        colors.addWidget(self.fill_color)
+        colors.addStretch()
+        bf.addRow("Colours:", colors)
+        right.addWidget(bg_box)
 
-        bg_label = QLabel("Background")
-        bg_label.setObjectName("sectionLabel")
-        controls_layout.addWidget(bg_label)
+        layout_box = QGroupBox("Layout")
+        lf = QFormLayout(layout_box)
+        self.orientation = QComboBox()
+        self.orientation.addItem("Landscape", "landscape")
+        self.orientation.addItem("Portrait", "portrait")
+        self.orientation.currentIndexChanged.connect(lambda _i: self._set_orientation(self.orientation.currentData()))
+        lf.addRow("Orientation:", self.orientation)
+        rot = QHBoxLayout()
+        self.rot_slider = QSlider(Qt.Orientation.Horizontal)
+        self.rot_slider.setRange(0, 3600)
+        self.rot_spin = QDoubleSpinBox()
+        self.rot_spin.setRange(0.0, 360.0)
+        self.rot_spin.setDecimals(1)
+        self.rot_spin.setSuffix("°")
+        self.rot_slider.valueChanged.connect(lambda v: self._sync_rotation(v / 10.0))
+        self.rot_spin.valueChanged.connect(self._sync_rotation)
+        rot.addWidget(self.rot_slider, stretch=1)
+        rot.addWidget(self.rot_spin)
+        lf.addRow("Rotation:", rot)
+        right.addWidget(layout_box)
 
-        bg_type_row = QHBoxLayout()
-        self.bg_type_combo = QComboBox()
-        for key, label in BG_KINDS:
-            self.bg_type_combo.addItem(label, key)
-        self.bg_type_combo.currentIndexChanged.connect(self._on_bg_type_changed)
-        self.fit_mode_combo = QComboBox()
-        for key, label in FIT_MODES:
-            self.fit_mode_combo.addItem(label, key)
-        self.fit_mode_combo.currentIndexChanged.connect(self._on_fit_mode_changed)
-        bg_type_row.addWidget(self.bg_type_combo)
-        bg_type_row.addWidget(self.fit_mode_combo)
-        controls_layout.addLayout(bg_type_row)
+        widgets_box = QGroupBox("Widgets")
+        wl = QVBoxLayout(widgets_box)
+        self.widget_list = QListWidget()
+        self.widget_list.setMinimumHeight(90)
+        self.widget_list.currentRowChanged.connect(self._on_list_selection)
+        self.widget_list.itemDoubleClicked.connect(lambda _item: self._edit_widget())
+        wl.addWidget(self.widget_list)
+        buttons = QHBoxLayout()
+        for text, slot in (("Add…", self._add_widget), ("Edit…", self._edit_widget),
+                           ("Duplicate", self._duplicate_widget), ("Remove", self._remove_widget)):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            buttons.addWidget(b)
+        wl.addLayout(buttons)
+        self.snap = QCheckBox("Snap to a 10 px grid while dragging")
+        self.snap.toggled.connect(lambda on: setattr(self.preview, "snap", 10 if on else 0))
+        wl.addWidget(self.snap)
+        right.addWidget(widgets_box, stretch=1)
 
-        bg_file_row = QHBoxLayout()
-        self.bg_file_field = QLineEdit()
-        self.bg_file_field.setReadOnly(True)
-        self.bg_file_field.setPlaceholderText("No file selected...")
-        self.bg_browse_btn = QPushButton("Browse...")
-        self.bg_browse_btn.clicked.connect(self._browse_background)
-        bg_file_row.addWidget(self.bg_file_field)
-        bg_file_row.addWidget(self.bg_browse_btn)
-        controls_layout.addLayout(bg_file_row)
+        files = QHBoxLayout()
+        files.addStretch()
+        open_btn = QPushButton("Open Scene…")
+        open_btn.clicked.connect(self._open_scene)
+        save_btn = QPushButton("Save Scene As…")
+        save_btn.clicked.connect(self._save_scene_as)
+        files.addWidget(open_btn)
+        files.addWidget(save_btn)
+        right.addLayout(files)
+        root.addLayout(right, stretch=1)
 
-        color_row = QHBoxLayout()
-        self.bg_color_btn = QPushButton()
-        self.bg_color_btn.clicked.connect(self._pick_bg_color)
-        self.fill_color_btn = QPushButton()
-        self.fill_color_btn.clicked.connect(self._pick_fill_color)
-        color_row.addWidget(QLabel("Solid / fill color:"))
-        color_row.addWidget(self.bg_color_btn)
-        color_row.addWidget(QLabel("Transparent-bg fill:"))
-        color_row.addWidget(self.fill_color_btn)
-        controls_layout.addLayout(color_row)
-        self._update_color_buttons()
+        self._on_bg_kind()
 
-        orient_label = QLabel("Orientation")
-        orient_label.setObjectName("sectionLabel")
-        controls_layout.addWidget(orient_label)
-        orient_row = QHBoxLayout()
-        self.btn_landscape = QPushButton("⬛ Landscape")
-        self.btn_portrait = QPushButton("▮ Portrait")
-        for b in (self.btn_landscape, self.btn_portrait):
-            b.setCheckable(True)
-        self.btn_landscape.clicked.connect(lambda: self._set_orientation("landscape"))
-        self.btn_portrait.clicked.connect(lambda: self._set_orientation("portrait"))
-        orient_row.addWidget(self.btn_landscape)
-        orient_row.addWidget(self.btn_portrait)
-        controls_layout.addLayout(orient_row)
-        orient_hint = QLabel(
-            "Swaps the working canvas aspect (e.g. 480x320 <-> 320x480); the panel's "
-            "fixed native buffer is rotated to fit at send time. Widgets rescale to stay on-canvas."
-        )
-        orient_hint.setObjectName("pageSubtitle")
-        orient_hint.setWordWrap(True)
-        controls_layout.addWidget(orient_hint)
+    # ── Background, layout ────────────────────────────────────
 
-        rot_label = QLabel("Fine rotation (on top of orientation; 180° flips it)")
-        rot_label.setObjectName("sectionLabel")
-        controls_layout.addWidget(rot_label)
-        rot_row = QHBoxLayout()
-        self.rotation_slider = QSlider(Qt.Orientation.Horizontal)
-        self.rotation_slider.setRange(0, 3600)   # tenths of a degree
-        self.rotation_slider.valueChanged.connect(self._on_rotation_slider)
-        self.rotation_spin = QDoubleSpinBox()
-        self.rotation_spin.setRange(0.0, 360.0)
-        self.rotation_spin.setSuffix("°")
-        self.rotation_spin.setDecimals(1)
-        self.rotation_spin.valueChanged.connect(self._on_rotation_spin)
-        rot_row.addWidget(self.rotation_slider, stretch=1)
-        rot_row.addWidget(self.rotation_spin)
-        controls_layout.addLayout(rot_row)
-
-        widgets_label = QLabel("Widgets (hardware stats, text, CPU graph)")
-        widgets_label.setObjectName("sectionLabel")
-        controls_layout.addWidget(widgets_label)
-        self.widgets_list = QListWidget()
-        self.widgets_list.setMaximumHeight(120)
-        self.widgets_list.currentRowChanged.connect(self._on_list_selection_changed)
-        controls_layout.addWidget(self.widgets_list)
-
-        widget_btn_row = QHBoxLayout()
-        for text, slot, name in (("Add...", self._add_widget, ""), ("Edit...", self._edit_widget, ""),
-                                 ("Duplicate", self._duplicate_widget, ""),
-                                 ("Remove", self._remove_widget, "dangerButton")):
-            btn = QPushButton(text)
-            if name:
-                btn.setObjectName(name)
-            btn.clicked.connect(slot)
-            widget_btn_row.addWidget(btn)
-        controls_layout.addLayout(widget_btn_row)
-
-        self.snap_check = QCheckBox("Snap to 10px grid while dragging")
-        self.snap_check.toggled.connect(lambda on: setattr(self.preview, "snap", 10 if on else 0))
-        controls_layout.addWidget(self.snap_check)
-
-        preset_label = QLabel("Scene file")
-        preset_label.setObjectName("sectionLabel")
-        controls_layout.addWidget(preset_label)
-        preset_row = QHBoxLayout()
-        save_preset_btn = QPushButton("Save As...")
-        save_preset_btn.clicked.connect(self._save_preset)
-        load_preset_btn = QPushButton("Open...")
-        load_preset_btn.clicked.connect(self._load_preset)
-        preset_row.addWidget(save_preset_btn)
-        preset_row.addWidget(load_preset_btn)
-        controls_layout.addLayout(preset_row)
-
-        controls_layout.addStretch()
-        content.addWidget(controls_panel, stretch=1)
-        layout.addLayout(content)
-
-        self._style_orientation_buttons()
-        self._on_bg_type_changed()
-        self._plain_look()
-
-    def _plain_look(self) -> None:
-        """Native-looking widgets: framed panels, bold section headings, small hints."""
-        for frame in self.findChildren(QFrame):
-            if frame.objectName() == "panel":
-                frame.setFrameShape(QFrame.Shape.StyledPanel)
-        for label in self.findChildren(QLabel):
-            name = label.objectName()
-            if name == "sectionLabel":
-                font = label.font()
-                font.setBold(True)
-                label.setFont(font)
-            elif name == "pageSubtitle":
-                font = label.font()
-                font.setPointSizeF(font.pointSizeF() * 0.9)
-                label.setFont(font)
-
-    # ── State helpers ────────────────────────────────────────
-
-    def _update_color_buttons(self):
-        self.bg_color_btn.setStyleSheet(f"background-color: {self._bg_color.name()};")
-        self.fill_color_btn.setStyleSheet(f"background-color: {self._fill_color.name()};")
-
-    def _on_bg_type_changed(self):
-        self._background_kind = self.bg_type_combo.currentData() or "color"
-        needs_file = self._background_kind != "color"
-        for w in (self.bg_file_field, self.bg_browse_btn, self.fit_mode_combo):
-            w.setVisible(needs_file)
+    def _on_bg_kind(self) -> None:
+        has_file = self.bg_kind.currentData() != "color"
+        for w in (self.file_label, self.bg_file, self.bg_browse, self.fit_label, self.fit):
+            w.setVisible(has_file)
         self._refresh_preview()
 
-    def _on_fit_mode_changed(self):
-        self._fit_mode = self.fit_mode_combo.currentData() or "cover"
-        self._refresh_preview()
-
-    def _browse_background(self):
-        filters = {
-            "image": "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
-            "gif": "GIF (*.gif)",
-            "video": "Video (*.mp4 *.avi *.mov *.mkv *.webm)",
-        }.get(self._background_kind, "All files (*)")
-        start = str(Path(self._background_path).parent) if self._background_path else str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(self, "Select background", start, filters)
+    def _choose_bg_file(self) -> None:
+        start = str(Path(self._bg_path).parent) if self._bg_path else str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a background", start,
+                                              FILE_FILTERS.get(self.bg_kind.currentData(), "All files (*)"))
         if path:
-            self._background_path = path
-            self.bg_file_field.setText(Path(path).name)
+            self._set_bg_path(path)
             self._refresh_preview()
 
-    def _pick_bg_color(self):
-        color = QColorDialog.getColor(self._bg_color, self, "Solid Background Color")
-        if color.isValid():
-            self._bg_color = color
-            self._update_color_buttons()
-            self._refresh_preview()
+    def _set_bg_path(self, path: str | None) -> None:
+        self._bg_path = path
+        self.bg_file.setText(Path(path).name if path else "")
+        self.bg_file.setToolTip(path or "")
 
-    def _pick_fill_color(self):
-        color = QColorDialog.getColor(self._fill_color, self, "Transparent-Background Fill Color")
-        if color.isValid():
-            self._fill_color = color
-            self._update_color_buttons()
-            self._refresh_preview()
-
-    def _on_rotation_slider(self, value: int):
-        self.rotation_spin.blockSignals(True)
-        self.rotation_spin.setValue(value / 10.0)
-        self.rotation_spin.blockSignals(False)
+    def _sync_rotation(self, degrees: float) -> None:
+        for w, value in ((self.rot_spin, degrees), (self.rot_slider, int(round(degrees * 10)))):
+            w.blockSignals(True)
+            w.setValue(value)
+            w.blockSignals(False)
         self._refresh_preview()
 
-    def _on_rotation_spin(self, value: float):
-        self.rotation_slider.blockSignals(True)
-        self.rotation_slider.setValue(int(value * 10))
-        self.rotation_slider.blockSignals(False)
-        self._refresh_preview()
-
-    # ── Widget list ──────────────────────────────────────────
-
-    def _sync_widgets_list(self):
-        self.widgets_list.blockSignals(True)
-        self.widgets_list.clear()
-        for w in self._widgets:
-            self.widgets_list.addItem(QListWidgetItem(describe_widget(w)))
-        self.widgets_list.blockSignals(False)
-
-    def _add_widget(self):
-        dialog = AddWidgetDialog(self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._widgets.append(dialog.to_widget())
-            self._sync_widgets_list()
-            self.widgets_list.setCurrentRow(len(self._widgets) - 1)
-            self._refresh_preview()
-
-    def _selected_row(self) -> int | None:
-        row = self.widgets_list.currentRow()
-        if row < 0:
-            self.log_message.emit("[ERROR] Select a widget first.")
-            return None
-        return row
-
-    def _edit_widget(self):
-        row = self._selected_row()
-        if row is None:
-            return
-        dialog = AddWidgetDialog(self, initial=self._widgets[row])
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._widgets[row] = dialog.to_widget()
-            self._sync_widgets_list()
-            self.widgets_list.setCurrentRow(row)
-            self._refresh_preview()
-
-    def _duplicate_widget(self):
-        row = self._selected_row()
-        if row is None:
-            return
-        src = self._widgets[row]
-        self._widgets.append(dataclasses.replace(src, x=src.x + 15, y=src.y + 15))
-        self._sync_widgets_list()
-        self.widgets_list.setCurrentRow(len(self._widgets) - 1)
-        self._refresh_preview()
-
-    def _remove_widget(self):
-        row = self._selected_row()
-        if row is not None:
-            self._delete_widget_at(row)
-
-    def _delete_widget_at(self, row: int):
-        if 0 <= row < len(self._widgets):
-            del self._widgets[row]
-            self._sync_widgets_list()
-            self._refresh_preview()
-
-    def _on_list_selection_changed(self, row: int):
-        self.preview.select(row if row >= 0 else None, emit=False)
-        self._refresh_preview()
-
-    def _on_preview_selection_changed(self, idx):
-        self.widgets_list.blockSignals(True)
-        self.widgets_list.setCurrentRow(idx if idx is not None else -1)
-        self.widgets_list.blockSignals(False)
-        self._refresh_preview()
-
-    def _on_widget_dragged(self):
-        row = self.preview.selected_index
-        if row is not None and 0 <= row < self.widgets_list.count():
-            self.widgets_list.item(row).setText(describe_widget(self._widgets[row]))
-        self._refresh_preview()
-
-    # ── Scene config ─────────────────────────────────────────
-
-    def _build_scene_config(self) -> SceneConfig:
-        return SceneConfig(
-            background=BackgroundConfig(
-                kind=self._background_kind,
-                path=self._background_path,
-                color=(self._bg_color.red(), self._bg_color.green(), self._bg_color.blue()),
-                fit_mode=self._fit_mode,
-            ),
-            transparent_fill=(self._fill_color.red(), self._fill_color.green(), self._fill_color.blue()),
-            orientation=self._orientation,
-            rotation=self.rotation_spin.value(),
-            widgets=list(self._widgets),
-            fps=self.fps_spin.value(),
-        )
-
-    def _apply_scene(self, cfg: SceneConfig) -> None:
-        """Load a scene into the editor (from a file or the autosave)."""
-        self._background_kind = cfg.background.kind
-        self._background_path = cfg.background.path
-        self._fit_mode = cfg.background.fit_mode
-        self._bg_color = QColor(*cfg.background.color)
-        self._fill_color = QColor(*cfg.transparent_fill)
-        self._widgets[:] = cfg.widgets          # keep the list object bound to the preview
-        self._orientation = cfg.orientation
-        self._style_orientation_buttons()
-
-        idx = self.bg_type_combo.findData(self._background_kind)
-        self.bg_type_combo.setCurrentIndex(max(0, idx))
-        fit_index = self.fit_mode_combo.findData(self._fit_mode)
-        if fit_index >= 0:
-            self.fit_mode_combo.setCurrentIndex(fit_index)
-        self.bg_file_field.setText(Path(self._background_path).name if self._background_path else "")
-        self._update_color_buttons()
-        self.rotation_spin.setValue(float(cfg.rotation))
-        self.fps_spin.setValue(int(cfg.fps))
-        self._sync_widgets_list()
-        self._refresh_preview()
-
-    def _device_native_size(self) -> tuple[int, int]:
-        return self.bridge.panel_size()
-
-    def _canvas_size(self) -> tuple[int, int]:
-        """The logical (oriented) canvas widgets are positioned on."""
-        return logical_canvas_size(*self._device_native_size(), self._orientation)
-
-    def _style_orientation_buttons(self) -> None:
-        for btn, key in ((self.btn_landscape, "landscape"), (self.btn_portrait, "portrait")):
-            btn.setChecked(self._orientation == key)
-            btn.setObjectName("primaryButton" if self._orientation == key else "")
-            btn.setStyleSheet("")   # re-polish after an objectName change
-
-    def _set_orientation(self, orientation: str):
+    def _set_orientation(self, orientation: str) -> None:
+        """Switch orientation, rescaling widget positions so they stay on the canvas."""
+        orientation = "portrait" if orientation == "portrait" else "landscape"
+        if self.orientation.currentData() != orientation:
+            self.orientation.blockSignals(True)
+            self.orientation.setCurrentIndex(self.orientation.findData(orientation))
+            self.orientation.blockSignals(False)
         if orientation == self._orientation:
-            self._style_orientation_buttons()
             return
         old_w, old_h = self._canvas_size()
         self._orientation = orientation
-        self._style_orientation_buttons()
         new_w, new_h = self._canvas_size()
-        if old_w > 0 and old_h > 0:   # rescale positions so nothing ends up off-canvas
-            sx, sy = new_w / old_w, new_h / old_h
-            for w in self._widgets:
-                w.x = max(0, min(new_w, int(w.x * sx)))
-                w.y = max(0, min(new_h, int(w.y * sy)))
-            self._sync_widgets_list()
+        for w in self._widgets:
+            w.x = min(new_w, max(0, round(w.x * new_w / old_w)))
+            w.y = min(new_h, max(0, round(w.y * new_h / old_h)))
+        self._sync_widgets_list()
         self._refresh_preview()
 
-    # ── Preview, live sync and autosave ──────────────────────
+    def _panel_size(self) -> tuple[int, int]:
+        return self.bridge.panel_size()
 
-    def _refresh_preview(self, data: dict | None = None):
+    def _canvas_size(self) -> tuple[int, int]:
+        return logical_canvas_size(*self._panel_size(), self._orientation)
+
+    # ── Widget list ───────────────────────────────────────────
+
+    def _sync_widgets_list(self) -> None:
+        row = self.widget_list.currentRow()
+        self.widget_list.blockSignals(True)
+        self.widget_list.clear()
+        self.widget_list.addItems([describe_widget(w) for w in self._widgets])
+        self.widget_list.setCurrentRow(min(row, len(self._widgets) - 1))
+        self.widget_list.blockSignals(False)
+
+    def _current_row(self) -> int | None:
+        row = self.widget_list.currentRow()
+        if 0 <= row < len(self._widgets):
+            return row
+        self.log_message.emit("[ERROR] Select a widget first.")
+        return None
+
+    def _add_widget(self) -> None:
+        dialog = WidgetDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._widgets.append(dialog.to_widget())
+            self._after_list_change(len(self._widgets) - 1)
+
+    def _edit_widget(self) -> None:
+        row = self._current_row()
+        if row is None:
+            return
+        dialog = WidgetDialog(self, initial=self._widgets[row])
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._widgets[row] = dialog.to_widget()
+            self._after_list_change(row)
+
+    def _duplicate_widget(self) -> None:
+        row = self._current_row()
+        if row is not None:
+            src = self._widgets[row]
+            self._widgets.append(dataclasses.replace(src, x=src.x + 15, y=src.y + 15))
+            self._after_list_change(len(self._widgets) - 1)
+
+    def _remove_widget(self) -> None:
+        row = self._current_row()
+        if row is not None:
+            self._delete_widget_at(row)
+
+    def _delete_widget_at(self, row: int) -> None:
+        if 0 <= row < len(self._widgets):
+            del self._widgets[row]
+            self._after_list_change(min(row, len(self._widgets) - 1))
+
+    def _after_list_change(self, select: int) -> None:
+        self._sync_widgets_list()
+        self.widget_list.setCurrentRow(select)
+        self._refresh_preview()
+
+    def _on_list_selection(self, row: int) -> None:
+        self.preview.select(row if row >= 0 else None, emit=False)
+        self._refresh_preview()
+
+    def _on_canvas_selection(self, index) -> None:
+        self.widget_list.blockSignals(True)
+        self.widget_list.setCurrentRow(-1 if index is None else index)
+        self.widget_list.blockSignals(False)
+        self._refresh_preview()
+
+    def _on_dragged(self) -> None:
+        index = self.preview.selected_index
+        if index is not None and index < self.widget_list.count():
+            self.widget_list.item(index).setText(describe_widget(self._widgets[index]))
+        self._refresh_preview()
+
+    # ── Scene <-> editor ──────────────────────────────────────
+
+    def _build_scene_config(self) -> SceneConfig:
+        return SceneConfig(
+            background=BackgroundConfig(kind=self.bg_kind.currentData(), path=self._bg_path,
+                                        color=_rgb(self.bg_color.color), fit_mode=self.fit.currentData()),
+            transparent_fill=_rgb(self.fill_color.color),
+            orientation=self._orientation,
+            rotation=self.rot_spin.value(),
+            widgets=list(self._widgets),
+            fps=self.fps.value(),
+        )
+
+    def _apply_scene(self, cfg: SceneConfig) -> None:
+        """Load a scene into the editor."""
+        self._widgets[:] = cfg.widgets        # same list object: the preview holds it
+        self._orientation = cfg.orientation
+        self.orientation.blockSignals(True)
+        self.orientation.setCurrentIndex(self.orientation.findData(cfg.orientation))
+        self.orientation.blockSignals(False)
+        self.bg_kind.setCurrentIndex(max(0, self.bg_kind.findData(cfg.background.kind)))
+        self.fit.setCurrentIndex(max(0, self.fit.findData(cfg.background.fit_mode)))
+        self._set_bg_path(cfg.background.path)
+        self.bg_color.set_color(QColor(*cfg.background.color))
+        self.fill_color.set_color(QColor(*cfg.transparent_fill))
+        self._sync_rotation(float(cfg.rotation))
+        self.fps.setValue(int(cfg.fps))
+        self._sync_widgets_list()
+        self._refresh_preview()
+
+    # ── Preview, live sync, autosave ──────────────────────────
+
+    def _refresh_preview(self, data: dict | None = None) -> None:
         cfg = self._build_scene_config()
         data = data if data is not None else scene_to_dict(cfg)
         w, h = self._canvas_size()
-        source = "from the connected panel" if self.bridge.connected else "last known panel size"
-        self.canvas_size_label.setText(f"Canvas: {w} x {h} ({self._orientation}, {source})")
+        where = "connected panel" if self.bridge.connected else "last known panel"
+        self.canvas_label.setText(f"{w} × {h} px, {self._orientation} ({where})")
         try:
-            metrics = sensors.read_all(scene_metric_keys(cfg))   # once, shared with hit-testing
-            # Redraw only when something visible changed: the scene, a stat's text
-            # (stats refresh once a second), the selection or the panel size.
+            metrics = sensors.read_all(scene_metric_keys(cfg))
+            # Redraw only if something visible changed (stats change at most once a second).
             key = (repr(data), tuple(sorted((k, m.display) for k, m in metrics.items())),
-                   self.preview.selected_index, self._device_native_size())
+                   self.preview.selected_index, self._panel_size())
             if key == self._preview_key:
                 return
-            bg = background_preview_frame(cfg.background)
-            frame = render_frame(cfg, *self._device_native_size(), bg, self._preview_history,
-                                 highlight_index=self.preview.selected_index, for_device=False,
-                                 metrics=metrics)
+            frame = render_frame(cfg, *self._panel_size(), background_preview_frame(cfg.background),
+                                 self._history, highlight_index=self.preview.selected_index, metrics=metrics)
             self.preview.set_image(frame, metrics=metrics)
             self._preview_key = key
         except Exception as e:
             self._preview_key = None
             self.log_message.emit(f"[ERROR] Preview failed: {e}")
 
-    def _tick(self):
+    def _tick(self) -> None:
         data = scene_to_dict(self._build_scene_config())
         if self.isVisible():
             self._refresh_preview(data)
@@ -541,7 +433,7 @@ class ScreenDesignerPage(QWidget):
         st = self.bridge.status
         return st.get("kind") == "scene" and st.get("path") == str(live_scene_path())
 
-    def _on_status(self, _st: dict) -> None:
+    def _on_status(self, _status: dict) -> None:
         live = self._is_live()
         self.play_btn.setChecked(live)
         self.play_btn.setText("Stop Live" if live else "Start Live")
@@ -549,45 +441,47 @@ class ScreenDesignerPage(QWidget):
     def _push_live(self, announce: bool = False) -> None:
         cfg = self._build_scene_config()
         try:
-            live_scene_path().parent.mkdir(parents=True, exist_ok=True)
+            scenes_dir().mkdir(parents=True, exist_ok=True)
             save_scene(cfg, live_scene_path())
         except OSError as e:
             self.log_message.emit(f"[ERROR] Could not write the live scene: {e}")
             return
-        pushed = scene_to_dict(cfg)
+        sent = scene_to_dict(cfg)
         self._push_in_flight = True
 
         def done(reply: dict) -> None:
             self._push_in_flight = False
-            if reply.get("ok"):
-                self._last_pushed = pushed
+            if not reply.get("ok"):
                 if announce:
-                    self.log_message.emit("[OK] Screen Designer is live" if reply.get("applied") else
-                                          "[INFO] Live scene saved; it will start when the cooler connects")
-                self.bridge.refresh()
-            elif announce:
-                self.play_btn.setChecked(False)
+                    self.play_btn.setChecked(False)
+                return
+            self._last_pushed = sent
+            if announce:
+                self.log_message.emit("[OK] Screen Designer is live" if reply.get("applied")
+                                      else "[INFO] Live scene saved; it starts when the cooler connects")
+            self.bridge.refresh()
 
         self.bridge.call({"cmd": "scene", "path": str(live_scene_path())}, done)
 
-    def _toggle_live(self, checked: bool):
+    def _toggle_live(self, checked: bool) -> None:
         if checked:
             self._push_live(announce=True)
-        else:
-            def done(reply: dict) -> None:
-                if reply.get("ok"):
-                    self.log_message.emit("[OK] Live scene stopped; screen off")
-                    self.bridge.refresh()
-            self.bridge.call({"cmd": "off"}, done)
+            return
+
+        def done(reply: dict) -> None:
+            if reply.get("ok"):
+                self.log_message.emit("[OK] Live scene stopped; screen off")
+                self.bridge.refresh()
+
+        self.bridge.call({"cmd": "off"}, done)
 
     def _autosave(self, data: dict) -> None:
+        self._last_autosaved = data   # even on failure, so a read-only disk isn't retried 5×/s
         try:
-            autosave_path().parent.mkdir(parents=True, exist_ok=True)
+            scenes_dir().mkdir(parents=True, exist_ok=True)
             save_scene(self._build_scene_config(), autosave_path())
-            self._last_autosaved = data
         except OSError as e:
             log.warning("Autosave failed: %s", e)
-            self._last_autosaved = data   # don't retry every tick
 
     def _restore_autosave(self) -> None:
         if autosave_path().is_file():
@@ -597,28 +491,27 @@ class ScreenDesignerPage(QWidget):
                 log.warning("Ignoring unreadable autosave %s: %s", autosave_path(), e)
         self._last_autosaved = scene_to_dict(self._build_scene_config())
 
-    # ── Scene files ──────────────────────────────────────────
+    # ── Scene files ───────────────────────────────────────────
 
-    def _save_preset(self):
-        scenes_dir().mkdir(parents=True, exist_ok=True)
-        path, _ = QFileDialog.getSaveFileName(self, "Save Scene", str(scenes_dir() / "scene.json"),
-                                              "lovingcool-control scene (*.json)")
-        if not path:
-            return
-        try:
-            save_scene(self._build_scene_config(), path)
-            self.log_message.emit(f"[OK] Saved scene: {path}")
-        except Exception as e:
-            self.log_message.emit(f"[ERROR] Could not save scene: {e}")
-
-    def _load_preset(self):
+    def _open_scene(self) -> None:
         start = str(scenes_dir()) if scenes_dir().is_dir() else str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(self, "Open Scene", start, "lovingcool-control scene (*.json)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open scene", start, "Scene (*.json)")
         if not path:
             return
         try:
             self._apply_scene(load_scene(path))
-            self.log_message.emit(f"[OK] Opened scene: {Path(path).name}")
+            self.log_message.emit(f"[OK] Opened scene {Path(path).stem}")
         except Exception as e:
             self.log_message.emit(f"[ERROR] Could not open scene: {e}")
-            QMessageBox.warning(self, "Open Scene Failed", str(e))
+            QMessageBox.warning(self, "Couldn't open scene", str(e))
+
+    def _save_scene_as(self) -> None:
+        scenes_dir().mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(self, "Save scene", str(scenes_dir() / "scene.json"), "Scene (*.json)")
+        if not path:
+            return
+        try:
+            save_scene(self._build_scene_config(), path)
+            self.log_message.emit(f"[OK] Saved scene {Path(path).stem}")
+        except OSError as e:
+            self.log_message.emit(f"[ERROR] Could not save scene: {e}")

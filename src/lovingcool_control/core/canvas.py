@@ -1,13 +1,12 @@
 """
 lovingcool-control :: core/canvas.py
-=============================
-Screen Designer's scene composer: layers a background (solid color,
-static image, GIF, or video) with live overlay widgets (hardware stat
-readouts, clock, a CPU history sparkline, custom text), flattens
-transparent backgrounds onto a chosen fill color, applies an arbitrary
-(not just 90-degree) rotation to the whole composed frame, and streams
-the result to the LCD via LCDController — all on a background thread so
-the GUI never blocks on sensor polling / JPEG encoding / serial I/O.
+====================================
+Scenes: a background (colour, image, GIF or video) with widgets drawn on
+top (text, a system stat, a CPU history graph), optionally rotated, and
+the player that streams one to the screen.
+
+A scene is plain data (SceneConfig) and is saved as JSON; the field names
+below are that file format, so keep them stable.
 """
 
 from __future__ import annotations
@@ -18,12 +17,12 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from . import sensors
 from .lcd import (
@@ -38,202 +37,43 @@ from .lcd import (
 
 log = logging.getLogger(__name__)
 
+RGB = tuple[int, int, int]
+BACKGROUND_KINDS = ("color", "image", "gif", "video")
+FIT_MODES = ("cover", "contain", "stretch", "center")
 
-# ──────────────────────────────────────────────────────────────
-#  Scene description
-# ──────────────────────────────────────────────────────────────
+
+# ── Scene model ──────────────────────────────────────────────
 
 @dataclass
 class Widget:
-    kind: str                              # "text" | "stat" | "cpu_graph"
+    kind: str                       # "text", "stat" or "cpu_graph"
     x: int = 10
     y: int = 10
     font_size: int = 28
-    color: tuple[int, int, int] = (255, 255, 255)
-    text: str = ""                         # kind == "text"
-    metric_key: str = "cpu_percent"        # kind == "stat"
-    show_label: bool = True                # kind == "stat": "CPU: 42%" vs "42%"
-    width: int = 140                       # kind == "cpu_graph"
-    height: int = 48                       # kind == "cpu_graph"
+    color: RGB = (255, 255, 255)
+    text: str = ""                  # text widgets
+    metric_key: str = "cpu_percent"  # stat widgets: a key from sensors.METRIC_CHOICES
+    show_label: bool = True         # stat widgets: "CPU: 42%" rather than "42%"
+    width: int = 140                # graph widgets
+    height: int = 48
 
 
 @dataclass
 class BackgroundConfig:
-    kind: str = "color"                    # "color" | "image" | "gif" | "video"
+    kind: str = "color"             # one of BACKGROUND_KINDS
     path: str | None = None
-    color: tuple[int, int, int] = (14, 17, 20)
-    fit_mode: str = "cover"                # "cover" | "contain" | "stretch" | "center"
+    color: RGB = (14, 17, 20)
+    fit_mode: str = "cover"         # one of FIT_MODES
 
 
 @dataclass
 class SceneConfig:
     background: BackgroundConfig = field(default_factory=BackgroundConfig)
-    transparent_fill: tuple[int, int, int] = (14, 17, 20)
-    orientation: str = "landscape"         # "landscape" | "portrait" — swaps the logical canvas aspect
-    rotation: float = 0.0                  # degrees, continuous fine-tune ON TOP of orientation
+    transparent_fill: RGB = (14, 17, 20)   # behind transparent pixels, letterboxing and rotation corners
+    orientation: str = "landscape"         # "portrait" composes on a swapped-aspect canvas
+    rotation: float = 0.0                  # extra rotation in degrees, applied after orientation
     widgets: list[Widget] = field(default_factory=list)
     fps: int = 10
-
-
-# ──────────────────────────────────────────────────────────────
-#  Background loading
-# ──────────────────────────────────────────────────────────────
-
-def open_background(cfg: BackgroundConfig, max_side: int | None = None) -> Iterator[Frame] | None:
-    """
-    An endless (frame, duration_ms) stream for the background, or None for
-    a solid colour (drawn fresh each frame). Videos are decoded lazily and
-    downscaled to max_side, so a long or 4K video costs no extra memory.
-    """
-    if cfg.kind == "color" or not cfg.path:
-        return None
-    if cfg.kind == "gif":
-        return cycle_frames(load_gif_frames(cfg.path), loop=True)
-    if cfg.kind == "video":
-        return iter_video_frames(cfg.path, max_side=max_side, loop=True)
-    img = Image.open(cfg.path)
-    img.load()
-    return itertools.repeat((img, 0))
-
-
-@lru_cache(maxsize=8)
-def _preview_frame_cached(kind: str, path: str, mtime: float) -> Image.Image:
-    frames = open_background(BackgroundConfig(kind=kind, path=path), max_side=1024)
-    assert frames is not None
-    return next(frames)[0]
-
-
-def background_preview_frame(cfg: BackgroundConfig) -> Image.Image | None:
-    """First frame of the background, cached per file, for cheap static previews."""
-    if cfg.kind == "color" or not cfg.path:
-        return None
-    return _preview_frame_cached(cfg.kind, cfg.path, Path(cfg.path).stat().st_mtime)
-
-
-# ──────────────────────────────────────────────────────────────
-#  Compositing
-# ──────────────────────────────────────────────────────────────
-
-def _flatten_transparency(img: Image.Image, fill_color: tuple[int, int, int]) -> Image.Image:
-    """Composite an alpha-having image onto a solid background color."""
-    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-        rgba = img.convert("RGBA")
-        base = Image.new("RGB", rgba.size, fill_color)
-        base.paste(rgba, mask=rgba.split()[-1])
-        return base
-    return img.convert("RGB")
-
-
-def _cover_resize(img: Image.Image, width: int, height: int) -> Image.Image:
-    """Resize to fully cover width x height (may crop), preserving aspect ratio."""
-    src_w, src_h = img.size
-    scale = max(width / src_w, height / src_h)
-    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - width) // 2
-    top = (new_h - height) // 2
-    return img.crop((left, top, left + width, top + height))
-
-
-def _contain_resize(img: Image.Image, width: int, height: int, fill_color: tuple[int, int, int]) -> Image.Image:
-    """Resize to fit entirely within width x height, letterboxed with fill_color."""
-    src_w, src_h = img.size
-    scale = min(width / src_w, height / src_h)
-    new_w, new_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-    canvas = Image.new("RGB", (width, height), fill_color)
-    canvas.paste(resized, ((width - new_w) // 2, (height - new_h) // 2))
-    return canvas
-
-
-def _center_resize(img: Image.Image, width: int, height: int, fill_color: tuple[int, int, int]) -> Image.Image:
-    """No scaling — center the image as-is, cropping or letterboxing as needed."""
-    canvas = Image.new("RGB", (width, height), fill_color)
-    src_w, src_h = img.size
-    left = (width - src_w) // 2
-    top = (height - src_h) // 2
-    canvas.paste(img, (left, top))
-    return canvas
-
-
-def resize_to_canvas(img: Image.Image, width: int, height: int,
-                      mode: str, fill_color: tuple[int, int, int]) -> Image.Image:
-    """Dispatch to the chosen fit mode: cover (default) / contain / stretch / center."""
-    if mode == "stretch":
-        return img.resize((width, height), Image.LANCZOS)
-    if mode == "contain":
-        return _contain_resize(img, width, height, fill_color)
-    if mode == "center":
-        return _center_resize(img, width, height, fill_color)
-    return _cover_resize(img, width, height)
-
-
-@lru_cache(maxsize=64)
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    # Cached: building the default TrueType font is the most expensive part of drawing a widget.
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
-
-
-def widget_display_text(w: Widget, metrics: dict[str, sensors.Metric]) -> str:
-    """The literal text a text/stat widget renders — shared by drawing and hit-testing."""
-    if w.kind == "text":
-        return w.text or " "
-    metric = metrics.get(w.metric_key)
-    if metric is None:
-        return "N/A"
-    return f"{metric.label}: {metric.display}" if w.show_label else metric.display
-
-
-_HITTEST_SCRATCH = Image.new("RGB", (1, 1))
-
-
-def widget_bbox(w: Widget, metrics: dict[str, sensors.Metric]) -> tuple[int, int, int, int]:
-    """Approximate on-canvas bounding box, for click/drag hit-testing in the GUI."""
-    if w.kind == "cpu_graph":
-        return (w.x, w.y, w.x + w.width, w.y + w.height)
-    draw = ImageDraw.Draw(_HITTEST_SCRATCH)
-    text = widget_display_text(w, metrics)
-    return draw.textbbox((w.x, w.y), text, font=_load_font(w.font_size))
-
-
-def _draw_widgets(img: Image.Image, widgets: list[Widget],
-                   metrics: dict[str, sensors.Metric], cpu_history: sensors.CpuHistory) -> None:
-    draw = ImageDraw.Draw(img)
-    for w in widgets:
-        if w.kind == "text":
-            draw.text((w.x, w.y), w.text, fill=w.color, font=_load_font(w.font_size))
-
-        elif w.kind == "stat":
-            metric = metrics.get(w.metric_key)
-            if metric is None:
-                continue
-            text = f"{metric.label}: {metric.display}" if w.show_label else metric.display
-            draw.text((w.x, w.y), text, fill=w.color, font=_load_font(w.font_size))
-
-        elif w.kind == "cpu_graph":
-            cpu_metric = metrics.get("cpu_percent")
-            history = cpu_history.sample(cpu_metric.value if cpu_metric else None)
-            _draw_sparkline(draw, w, history)
-
-
-def _draw_sparkline(draw: ImageDraw.ImageDraw, w: Widget, history: list[float]) -> None:
-    """The 'cool feature': a live CPU-usage history graph, gauge-style."""
-    x0, y0, x1, y1 = w.x, w.y, w.x + w.width, w.y + w.height
-    draw.rounded_rectangle((x0, y0, x1, y1), radius=6, fill=(0, 0, 0, 0),
-                            outline=tuple(min(255, c + 40) for c in w.color), width=1)
-    if len(history) >= 2:
-        n = len(history)
-        points = []
-        for i, v in enumerate(history):
-            px = x0 + 4 + (i / max(1, n - 1)) * (w.width - 8)
-            py = y1 - 4 - (max(0.0, min(100.0, v)) / 100.0) * (w.height - 8)
-            points.append((px, py))
-        draw.line(points, fill=w.color, width=2, joint="curve")
-    label = f"CPU {history[-1]:.0f}%" if history else "CPU --"
-    draw.text((x0 + 6, y0 + 4), label, fill=w.color, font=_load_font(max(10, w.font_size // 2)))
 
 
 def scene_metric_keys(cfg: SceneConfig) -> set[str]:
@@ -243,6 +83,127 @@ def scene_metric_keys(cfg: SceneConfig) -> set[str]:
         keys.add("cpu_percent")
     return keys
 
+
+# ── Backgrounds ──────────────────────────────────────────────
+
+def open_background(cfg: BackgroundConfig, max_side: int | None = None) -> Iterator[Frame] | None:
+    """
+    Endless (image, duration_ms) frames for the background, or None for a
+    plain colour. Videos are decoded as they play and scaled down to
+    max_side, so their length and resolution don't affect memory.
+    """
+    if cfg.kind == "color" or not cfg.path:
+        return None
+    if cfg.kind == "video":
+        return iter_video_frames(cfg.path, max_side=max_side, loop=True)
+    if cfg.kind == "gif":
+        return cycle_frames(load_gif_frames(cfg.path), loop=True)
+    with Image.open(cfg.path) as still:
+        still.load()
+        frame = still.copy()
+    return itertools.repeat((frame, 0))
+
+
+@lru_cache(maxsize=8)
+def _first_frame(kind: str, path: str, mtime: float) -> Image.Image:
+    stream = open_background(BackgroundConfig(kind=kind, path=path), max_side=1024)
+    return next(stream)[0]
+
+
+def background_preview_frame(cfg: BackgroundConfig) -> Image.Image | None:
+    """The background's first frame, cached per file (and refreshed if the file changes)."""
+    if cfg.kind == "color" or not cfg.path:
+        return None
+    return _first_frame(cfg.kind, cfg.path, Path(cfg.path).stat().st_mtime)
+
+
+def _opaque(img: Image.Image, fill: RGB) -> Image.Image:
+    """Drop any transparency by laying the image over a solid fill."""
+    if img.mode == "P" and "transparency" in img.info:
+        img = img.convert("RGBA")
+    if img.mode in ("RGBA", "LA", "PA"):
+        rgba = img.convert("RGBA")
+        backdrop = Image.new("RGBA", rgba.size, fill + (255,))
+        return Image.alpha_composite(backdrop, rgba).convert("RGB")
+    return img.convert("RGB")
+
+
+def resize_to_canvas(img: Image.Image, width: int, height: int, mode: str, fill_color: RGB) -> Image.Image:
+    """
+    Fit an image to width x height:
+      cover   - scale to fill, cropping the overflow (centred)
+      contain - scale to fit inside, padding with fill_color
+      stretch - scale to exactly that size, ignoring aspect ratio
+      center  - no scaling; crop or pad around the centre
+    """
+    size = (width, height)
+    if mode == "stretch":
+        return img.resize(size, Image.LANCZOS)
+    if mode == "contain":
+        return ImageOps.pad(img, size, method=Image.LANCZOS, color=fill_color)
+    if mode == "center":
+        board = Image.new("RGB", size, fill_color)
+        board.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+        return board
+    return ImageOps.fit(img, size, method=Image.LANCZOS)
+
+
+# ── Widgets ──────────────────────────────────────────────────
+
+@lru_cache(maxsize=64)
+def _font(size: int) -> ImageFont.ImageFont:
+    """The bundled default font at a size (cached: building it is the slow part of drawing text)."""
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:   # Pillow < 10.1 has a single fixed size
+        return ImageFont.load_default()
+
+
+def widget_display_text(w: Widget, metrics: dict[str, sensors.Metric]) -> str:
+    """What a text or stat widget shows."""
+    if w.kind == "text":
+        return w.text or " "
+    m = metrics.get(w.metric_key)
+    if m is None:
+        return "N/A"
+    return f"{m.label}: {m.display}" if w.show_label else m.display
+
+
+def widget_bbox(w: Widget, metrics: dict[str, sensors.Metric]) -> tuple[int, int, int, int]:
+    """Where a widget sits on the canvas (left, top, right, bottom), for selection and dragging."""
+    if w.kind == "cpu_graph":
+        return w.x, w.y, w.x + w.width, w.y + w.height
+    left, top, right, bottom = _font(w.font_size).getbbox(widget_display_text(w, metrics))
+    return w.x + left, w.y + top, w.x + right, w.y + bottom
+
+
+def _paint_text(draw: ImageDraw.ImageDraw, w: Widget, metrics, history) -> None:
+    draw.text((w.x, w.y), widget_display_text(w, metrics), fill=tuple(w.color), font=_font(w.font_size))
+
+
+def _paint_graph(draw: ImageDraw.ImageDraw, w: Widget, metrics, history: sensors.CpuHistory) -> None:
+    cpu = metrics.get("cpu_percent")
+    values = history.sample(cpu.value if cpu else None)
+    left, top, right, bottom = w.x, w.y, w.x + w.width, w.y + w.height
+    frame_color = tuple(min(255, int(c * 0.6) + 60) for c in w.color)
+    draw.rounded_rectangle((left, top, right, bottom), radius=6, outline=frame_color, width=1)
+
+    pad = 4
+    inner_w, inner_h = max(1, w.width - 2 * pad), max(1, w.height - 2 * pad)
+    if len(values) > 1:
+        step = inner_w / (len(values) - 1)
+        points = [(left + pad + i * step, bottom - pad - inner_h * min(max(v, 0.0), 100.0) / 100.0)
+                  for i, v in enumerate(values)]
+        draw.line(points, fill=tuple(w.color), width=2, joint="curve")
+
+    caption = f"CPU {values[-1]:.0f}%" if values else "CPU --"
+    draw.text((left + pad + 2, top + pad), caption, fill=tuple(w.color), font=_font(max(10, w.font_size // 2)))
+
+
+_PAINTERS: dict[str, Callable] = {"text": _paint_text, "stat": _paint_text, "cpu_graph": _paint_graph}
+
+
+# ── Rendering ────────────────────────────────────────────────
 
 def compose_scene(
     cfg: SceneConfig,
@@ -254,34 +215,32 @@ def compose_scene(
     metrics: dict[str, sensors.Metric] | None = None,
 ) -> Image.Image:
     """
-    Compose one frame at the LOGICAL (already-oriented) canvas size —
-    background (fit + transparency flatten) + widgets + cosmetic rotation.
-    Widget x/y are relative to this canvas. This is what the GUI preview
-    shows and what drag-to-move hit-testing operates against, regardless
-    of landscape/portrait — the caller is responsible for picking
-    logical_width/logical_height via logical_canvas_size() first.
+    Draw one frame at the logical (orientation-adjusted) canvas size: what
+    editors preview and what widget positions refer to. highlight_index
+    outlines one widget (the designer's selection).
     """
-    if bg_frame is not None:
-        canvas = _flatten_transparency(bg_frame, cfg.transparent_fill)
-        canvas = resize_to_canvas(canvas, logical_width, logical_height, cfg.background.fit_mode, cfg.transparent_fill)
+    size = (logical_width, logical_height)
+    if bg_frame is None:
+        frame = Image.new("RGB", size, tuple(cfg.background.color))
     else:
-        canvas = Image.new("RGB", (logical_width, logical_height), cfg.background.color)
+        frame = resize_to_canvas(_opaque(bg_frame, tuple(cfg.transparent_fill)), *size,
+                                 cfg.background.fit_mode, tuple(cfg.transparent_fill))
 
     if metrics is None:
         metrics = sensors.read_all(scene_metric_keys(cfg))
-    _draw_widgets(canvas, cfg.widgets, metrics, cpu_history)
+    draw = ImageDraw.Draw(frame)
+    for w in cfg.widgets:
+        painter = _PAINTERS.get(w.kind)
+        if painter is not None:
+            painter(draw, w, metrics, cpu_history)
 
     if highlight_index is not None and 0 <= highlight_index < len(cfg.widgets):
-        draw = ImageDraw.Draw(canvas)
-        bbox = widget_bbox(cfg.widgets[highlight_index], metrics)
-        pad = 4
-        draw.rectangle((bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad),
-                        outline=(255, 255, 255), width=1)
+        left, top, right, bottom = widget_bbox(cfg.widgets[highlight_index], metrics)
+        draw.rectangle((left - 4, top - 4, right + 4, bottom + 4), outline=(255, 255, 255), width=1)
 
-    if cfg.rotation % 360 != 0:
-        canvas = canvas.rotate(-cfg.rotation, resample=Image.BICUBIC,
-                                expand=False, fillcolor=cfg.transparent_fill)
-    return canvas
+    if cfg.rotation % 360:
+        frame = frame.rotate(-cfg.rotation, resample=Image.BICUBIC, fillcolor=tuple(cfg.transparent_fill))
+    return frame
 
 
 def render_frame(
@@ -295,37 +254,28 @@ def render_frame(
     metrics: dict[str, sensors.Metric] | None = None,
 ) -> Image.Image:
     """
-    width/height = the device's fixed native panel resolution.
-
-    Returns the logical, already-oriented composition by default (what
-    the preview/drag editor should use). Pass for_device=True to instead
-    get the final frame rotated/fit to the device's native raster,
-    ready to hand to LCDController.send_image().
+    Render for a panel of width x height. By default returns the logical
+    frame (for previews); for_device=True returns it oriented to the
+    panel's native raster, ready to send.
     """
-    logical_w, logical_h = logical_canvas_size(width, height, cfg.orientation)
-    composed = compose_scene(cfg, logical_w, logical_h, bg_frame, cpu_history, highlight_index, metrics)
-    if for_device:
-        return orient_for_device(composed, width, height, cfg.orientation, cfg.transparent_fill)
-    return composed
+    frame = compose_scene(cfg, *logical_canvas_size(width, height, cfg.orientation), bg_frame,
+                          cpu_history, highlight_index, metrics)
+    return orient_for_device(frame, width, height, cfg.orientation, tuple(cfg.transparent_fill)) \
+        if for_device else frame
 
 
-# ──────────────────────────────────────────────────────────────
-#  Live playback (runs in the LCDController's single playback slot)
-# ──────────────────────────────────────────────────────────────
+# ── Playback ─────────────────────────────────────────────────
 
 class ScenePlayer:
     """
-    Continuously renders a SceneConfig and streams it to the LCD.
-
-    It runs as the controller's playback, so starting a GIF or video
-    elsewhere stops the scene (and vice versa) instead of both writing to
-    the port at once.
+    Renders a scene continuously and streams it to the screen, as the
+    LCDController's one playback: showing anything else stops the scene.
     """
 
     def __init__(self, lcd: LCDController):
         self.lcd = lcd
         self._stop: threading.Event | None = None
-        self._cpu_history = sensors.CpuHistory()
+        self._history = sensors.CpuHistory()
         self.last_frame: Image.Image | None = None
         self.last_error: str | None = None
         self.frames_sent = 0
@@ -337,43 +287,42 @@ class ScenePlayer:
 
     def start(self, cfg: SceneConfig) -> None:
         self.lcd.ensure_info()
-        native_w, native_h = self.lcd.size
-        background = open_background(cfg.background, max_side=max(native_w, native_h))  # may raise
-        logical_w, logical_h = logical_canvas_size(native_w, native_h, cfg.orientation)
+        panel_w, panel_h = self.lcd.size
+        backgrounds = open_background(cfg.background, max_side=max(panel_w, panel_h))   # may raise
+        canvas_size = logical_canvas_size(panel_w, panel_h, cfg.orientation)
+        period = 1.0 / max(1, cfg.fps)
         self.last_error = None
 
-        def loop(stop: threading.Event) -> None:
-            interval = 1.0 / max(1, cfg.fps)
-            due = time.monotonic()
-            last_pixels: bytes | None = None
+        def run(stop: threading.Event) -> None:
+            previous: bytes | None = None
+            next_at = time.monotonic()
             while not stop.is_set():
-                bg = next(background)[0] if background is not None else None
+                background = next(backgrounds)[0] if backgrounds is not None else None
                 try:
-                    composed = compose_scene(cfg, logical_w, logical_h, bg, self._cpu_history)
-                    pixels = composed.tobytes()
-                    if pixels != last_pixels:
-                        # Most frames of a stats scene are identical (stats refresh once a
-                        # second); skipping them saves the rotate, JPEG encode and USB
-                        # transfer. Panels that blank stay lit through the keep-alive.
-                        self.last_frame = composed   # the GUI preview shows this
-                        self.lcd.send_frame(orient_for_device(composed, native_w, native_h,
-                                                              cfg.orientation, cfg.transparent_fill))
-                        last_pixels = pixels
-                        self.frames_sent += 1
-                    else:
+                    frame = compose_scene(cfg, *canvas_size, background, self._history)
+                    pixels = frame.tobytes()
+                    if pixels == previous:
+                        # Unchanged (stats only refresh once a second): skip the rotate,
+                        # encode and transfer. The keep-alive holds the picture meanwhile.
                         self.frames_skipped += 1
+                    else:
+                        self.last_frame = frame
+                        self.lcd.send_frame(orient_for_device(frame, panel_w, panel_h, cfg.orientation,
+                                                              tuple(cfg.transparent_fill)))
+                        previous = pixels
+                        self.frames_sent += 1
                 except Exception as e:
                     self.last_error = str(e)
-                    log.error("Scene playback error: %s", e)
+                    log.error("Scene frame failed: %s", e)
                     if not self.lcd.device.connected:
                         return
-                due = max(due + interval, time.monotonic())
-                stop.wait(due - time.monotonic())
+                next_at = max(next_at + period, time.monotonic())
+                stop.wait(next_at - time.monotonic())
 
-        self._stop = self.lcd.start_playback(loop, "scene-player")
+        self._stop = self.lcd.start_playback(run, "scene-player")
 
     def stop(self) -> None:
-        """Stop the scene if it is still the active playback (leave a replacement alone)."""
+        """Stop this scene, unless something else has already replaced it."""
         if self.running:
             self.lcd.stop_playback()
             try:
@@ -383,60 +332,50 @@ class ScenePlayer:
         self._stop = None
 
 
-# ──────────────────────────────────────────────────────────────
-#  Scene files (the Screen Designer's preset JSON)
-# ──────────────────────────────────────────────────────────────
+# ── Scene files ──────────────────────────────────────────────
 
-def _rgb(value, default: tuple[int, int, int]) -> tuple[int, int, int]:
+def _color(value, fallback: RGB) -> RGB:
     try:
-        r, g, b = (int(c) for c in value)
+        r, g, b = (max(0, min(255, int(c))) for c in value)
     except (TypeError, ValueError):
-        return default
-    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+        return fallback
+    return r, g, b
 
 
 def scene_to_dict(cfg: SceneConfig) -> dict:
-    return {
-        "background": dataclasses.asdict(cfg.background),
-        "transparent_fill": list(cfg.transparent_fill),
-        "orientation": cfg.orientation,
-        "rotation": cfg.rotation,
-        "fps": cfg.fps,
-        "widgets": [dataclasses.asdict(w) for w in cfg.widgets],
-    }
+    data = dataclasses.asdict(cfg)
+    data["transparent_fill"] = list(cfg.transparent_fill)
+    return {k: data[k] for k in ("background", "transparent_fill", "orientation", "rotation", "fps", "widgets")}
 
 
 def scene_from_dict(data: dict) -> SceneConfig:
-    """Build a SceneConfig from preset JSON, tolerating missing keys; unknown widget fields are an error."""
-    default = SceneConfig()
+    """Read scene JSON, filling gaps with defaults. Unknown widget fields raise TypeError."""
+    base = SceneConfig()
     bg = data.get("background") or {}
-    background = BackgroundConfig(
-        kind=bg.get("kind", "color") if bg.get("kind") in ("color", "image", "gif", "video") else "color",
-        path=bg.get("path"),
-        color=_rgb(bg.get("color"), default.background.color),
-        fit_mode=bg.get("fit_mode", "cover"),
-    )
     widgets = []
-    for wd in data.get("widgets", []):
-        wd = dict(wd)
-        if "color" in wd:
-            wd["color"] = _rgb(wd["color"], (255, 255, 255))
-        widgets.append(Widget(**wd))
+    for raw in data.get("widgets", []):
+        raw = dict(raw)
+        if "color" in raw:
+            raw["color"] = _color(raw["color"], (255, 255, 255))
+        widgets.append(Widget(**raw))
     return SceneConfig(
-        background=background,
-        transparent_fill=_rgb(data.get("transparent_fill"), default.transparent_fill),
+        background=BackgroundConfig(
+            kind=bg.get("kind") if bg.get("kind") in BACKGROUND_KINDS else "color",
+            path=bg.get("path"),
+            color=_color(bg.get("color"), base.background.color),
+            fit_mode=bg.get("fit_mode") if bg.get("fit_mode") in FIT_MODES else "cover",
+        ),
+        transparent_fill=_color(data.get("transparent_fill"), base.transparent_fill),
         orientation="portrait" if data.get("orientation") == "portrait" else "landscape",
         rotation=float(data.get("rotation", 0.0)),
         widgets=widgets,
-        fps=max(1, min(60, int(data.get("fps", default.fps)))),
+        fps=min(60, max(1, int(data.get("fps", base.fps)))),
     )
 
 
 def load_scene(path: str | Path) -> SceneConfig:
-    with open(path, encoding="utf8") as f:
-        return scene_from_dict(json.load(f))
+    return scene_from_dict(json.loads(Path(path).read_text(encoding="utf8")))
 
 
 def save_scene(cfg: SceneConfig, path: str | Path) -> None:
-    with open(path, "w", encoding="utf8") as f:
-        json.dump(scene_to_dict(cfg), f, indent=2)
+    Path(path).write_text(json.dumps(scene_to_dict(cfg), indent=2), encoding="utf8")
