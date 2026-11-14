@@ -12,7 +12,9 @@ the GUI never blocks on sensor polling / JPEG encoding / serial I/O.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
+import json
 import logging
 import threading
 import time
@@ -354,3 +356,62 @@ class ScenePlayer:
             except Exception:
                 pass
         self._stop = None
+
+
+# ──────────────────────────────────────────────────────────────
+#  Scene files (the Screen Designer's preset JSON)
+# ──────────────────────────────────────────────────────────────
+
+def _rgb(value, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    try:
+        r, g, b = (int(c) for c in value)
+    except (TypeError, ValueError):
+        return default
+    return (max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+
+
+def scene_to_dict(cfg: SceneConfig) -> dict:
+    return {
+        "background": dataclasses.asdict(cfg.background),
+        "transparent_fill": list(cfg.transparent_fill),
+        "orientation": cfg.orientation,
+        "rotation": cfg.rotation,
+        "fps": cfg.fps,
+        "widgets": [dataclasses.asdict(w) for w in cfg.widgets],
+    }
+
+
+def scene_from_dict(data: dict) -> SceneConfig:
+    """Build a SceneConfig from preset JSON, tolerating missing keys; unknown widget fields are an error."""
+    default = SceneConfig()
+    bg = data.get("background") or {}
+    background = BackgroundConfig(
+        kind=bg.get("kind", "color") if bg.get("kind") in ("color", "image", "gif", "video") else "color",
+        path=bg.get("path"),
+        color=_rgb(bg.get("color"), default.background.color),
+        fit_mode=bg.get("fit_mode", "cover"),
+    )
+    widgets = []
+    for wd in data.get("widgets", []):
+        wd = dict(wd)
+        if "color" in wd:
+            wd["color"] = _rgb(wd["color"], (255, 255, 255))
+        widgets.append(Widget(**wd))
+    return SceneConfig(
+        background=background,
+        transparent_fill=_rgb(data.get("transparent_fill"), default.transparent_fill),
+        orientation="portrait" if data.get("orientation") == "portrait" else "landscape",
+        rotation=float(data.get("rotation", 0.0)),
+        widgets=widgets,
+        fps=max(1, min(60, int(data.get("fps", default.fps)))),
+    )
+
+
+def load_scene(path: str | Path) -> SceneConfig:
+    with open(path, encoding="utf8") as f:
+        return scene_from_dict(json.load(f))
+
+
+def save_scene(cfg: SceneConfig, path: str | Path) -> None:
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(scene_to_dict(cfg), f, indent=2)

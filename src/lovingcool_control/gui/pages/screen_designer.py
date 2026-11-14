@@ -51,6 +51,7 @@ from lovingcool_control.core.canvas import (
     Widget,
     background_preview_frame,
     render_frame,
+    save_scene,
     widget_bbox,
 )
 from lovingcool_control.core.lcd import LCDController
@@ -817,21 +818,8 @@ class ScreenDesignerPage(QWidget):
                                                "lovingcool-control scene (*.json)")
         if not path:
             return
-        data = {
-            "background": dataclasses.asdict(BackgroundConfig(
-                kind=self._background_kind, path=self._background_path,
-                color=(self._bg_color.red(), self._bg_color.green(), self._bg_color.blue()),
-                fit_mode=self._fit_mode,
-            )),
-            "transparent_fill": (self._fill_color.red(), self._fill_color.green(), self._fill_color.blue()),
-            "orientation": self._orientation,
-            "rotation": self.rotation_spin.value(),
-            "fps": self.fps_spin.value(),
-            "widgets": [dataclasses.asdict(w) for w in self._widgets],
-        }
         try:
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2)
+            save_scene(self._build_scene_config(), path)
             self.log_message.emit(f"[OK] Saved preset: {Path(path).name}")
         except Exception as e:
             self.log_message.emit(f"[ERROR] Could not save preset: {e}")

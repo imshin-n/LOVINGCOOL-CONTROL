@@ -1,50 +1,58 @@
 #!/usr/bin/env bash
 # lovingcool-control :: packaging/linux/install_service.sh
-# ===================================================
-# Installs lovingcool-control as a systemd --user service (see lovingcool-control.service
-# for why it's a user service, not a system one). Restart=always means
-# it auto-restarts whenever the app exits — closing the window doesn't
-# stop it, only `systemctl --user stop lovingcool-control` does.
+# ========================================================
+# Installs the commands (lovingcool-controld, lovingcool-ctl, lovingcool-control)
+# into ~/.local/bin with `uv tool install`, then installs and starts the
+# systemd --user service. Safe to re-run to upgrade after pulling changes.
 #
-# Run this from a normal logged-in graphical session (not bare SSH) so
-# it can capture DISPLAY/WAYLAND_DISPLAY for the GUI to actually show.
+# If the old "lovi-ctrl" service from the original project is installed, it
+# is stopped and disabled (it would fight over the screen); pass
+# --remove-old to also delete its unit file and ~/.local/share/lovi-ctrl.
 #
 # Usage:
-#   ./build_linux.sh              (build dist/lovingcool-control first)
-#   packaging/linux/install_service.sh
+#   packaging/linux/install_service.sh [--remove-old]
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
 
-BIN_SRC="dist/lovingcool-control"
-INSTALL_DIR="$HOME/.local/share/lovingcool-control"
-UNIT_DIR="$HOME/.config/systemd/user"
+REMOVE_OLD=0
+[ "${1:-}" = "--remove-old" ] && REMOVE_OLD=1
 
-if [ ! -f "$BIN_SRC" ]; then
-    echo "[ERROR] $BIN_SRC not found — run ./build_linux.sh first." >&2
-    exit 1
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT=lovingcool-control.service
+
+command -v uv >/dev/null || { echo "[ERROR] uv not found: https://docs.astral.sh/uv/" >&2; exit 1; }
+
+echo "==> Installing commands with uv tool (into ~/.local/bin)"
+uv tool install --force --reinstall .
+
+if systemctl --user cat lovi-ctrl.service >/dev/null 2>&1; then
+    echo "==> Disabling the old lovi-ctrl service"
+    systemctl --user disable --now lovi-ctrl.service 2>/dev/null || true
+    systemctl --user reset-failed lovi-ctrl.service 2>/dev/null || true
+    if [ "$REMOVE_OLD" = 1 ]; then
+        rm -f "$UNIT_DIR/lovi-ctrl.service"
+        rm -rf "$HOME/.local/share/lovi-ctrl"
+        echo "    removed its unit file and ~/.local/share/lovi-ctrl"
+    else
+        echo "    (left its files; re-run with --remove-old to delete them)"
+    fi
 fi
 
-mkdir -p "$INSTALL_DIR" "$UNIT_DIR"
-cp "$BIN_SRC" "$INSTALL_DIR/lovingcool-control"
-chmod +x "$INSTALL_DIR/lovingcool-control"
-cp packaging/linux/lovingcool-control.service "$UNIT_DIR/lovingcool-control.service"
-
+echo "==> Installing $UNIT"
+mkdir -p "$UNIT_DIR"
+cp "packaging/linux/$UNIT" "$UNIT_DIR/$UNIT"
 systemctl --user daemon-reload
+systemctl --user enable "$UNIT"
+systemctl --user restart "$UNIT"
 
-# Best-effort: make sure systemd --user actually has this session's
-# display environment (needed for the GUI to appear). Harmless if it
-# fails (e.g. already imported, or running under a DE that does this
-# automatically already).
-systemctl --user import-environment DISPLAY WAYLAND_DISPLAY XAUTHORITY 2>/dev/null || true
-
-systemctl --user enable --now lovingcool-control.service
-
+sleep 2
 echo
-echo "Installed and started."
-systemctl --user status lovingcool-control.service --no-pager || true
+systemctl --user --no-pager --lines=5 status "$UNIT" || true
 echo
-echo "Stop (won't auto-restart):    systemctl --user stop lovingcool-control"
-echo "Resume:                       systemctl --user start lovingcool-control"
-echo "Disable auto-start on login:  systemctl --user disable lovingcool-control"
-echo "Logs:                         journalctl --user -u lovingcool-control -f"
+"$HOME/.local/bin/lovingcool-ctl" status || true
+echo
+echo "Control it:   lovingcool-ctl --help"
+echo "Logs:         journalctl --user -u lovingcool-control -f"
+echo "Stop:         systemctl --user stop lovingcool-control"
+echo "Uninstall:    packaging/linux/uninstall_service.sh"

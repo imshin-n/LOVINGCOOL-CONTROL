@@ -183,8 +183,10 @@ class AIODevice:
             )
         try:
             # dsrdtr: at 2 Mbaud the 7788 drops/corrupts bytes without DTR flow control.
+            # exclusive: a second process (GUI vs. background service) gets a clear
+            # "busy" error instead of both writing frames into the same port.
             self._dev = serial.Serial(port, baudrate=self.spec.baudrate, timeout=0.1,
-                                      dsrdtr=self.spec.dtr)
+                                      dsrdtr=self.spec.dtr, exclusive=True)
             if self.spec.dtr:
                 self._dev.dtr = True
                 time.sleep(0.2)   # let the MCU's USB-CDC stack settle after DTR

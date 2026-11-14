@@ -569,40 +569,61 @@ Windows, add `--collect-all hid` to the `pyinstaller` call in the script.
 
 ---
 
-## Running as a service (auto-start, auto-restart, one-command stop)
+## Background service and `lovingcool-ctl` (Linux)
 
-Separate install scripts per platform under `packaging/`, both giving the
-same behavior: lovingcool-control auto-starts, and if it ever exits — window
-closed, crash, anything — it's automatically relaunched a few seconds
-later ("loop run when done"), continuing until you deliberately stop it.
+The screen is driven by **`lovingcool-controld`**, a small background
+service with no window. It:
 
-**Linux — systemd `--user` service** (`packaging/linux/`):
+- starts at login without needing the desktop (it never loads Qt);
+- waits for the cooler, connects when it appears, and reconnects after an
+  unplug, a suspend or a USB reset;
+- remembers what you last showed (image, GIF, video, text or a Screen
+  Designer scene) and the brightness, and restores both on reconnect,
+  restart or reboot (`~/.config/lovingcool-control/state.json`);
+- keeps panels that blank without a steady stream (like the SC60) lit.
+
+Install or upgrade (installs the commands into `~/.local/bin` with
+`uv tool`, then enables the `systemd --user` unit):
 
 ```bash
-./build_linux.sh
 packaging/linux/install_service.sh
 ```
 
-This is a **user** service on purpose, not a system one — it's a GUI app
-that needs the logged-in session's `DISPLAY`/`WAYLAND_DISPLAY`, which a
-root-level system service doesn't have access to. Run the installer from
-an actual graphical login session (not bare SSH) so it can capture that
-environment. `Restart=always` in the unit file is the auto-restart loop;
-`StartLimitBurst=10` over 60s keeps a persistently-broken binary from
-crash-looping forever.
+If the original project's `lovi-ctrl` service is installed, the script
+disables it so the two don't fight over the screen; add `--remove-old` to
+also delete its files.
+
+Control it from a terminal, a script, a keybind or a bar widget:
 
 ```bash
-packaging/linux/stop_service.sh        # stop WITHOUT triggering auto-restart
-packaging/linux/uninstall_service.sh   # remove the service entirely
-journalctl --user -u lovingcool-control -f      # logs
+lovingcool-ctl status
+lovingcool-ctl show ~/Pictures/cat.gif          # image, GIF or video (loops)
+lovingcool-ctl text "Hello" --fg ffcc00 --size 64
+lovingcool-ctl scene ~/scenes/stats.json        # saved from the Screen Designer
+lovingcool-ctl brightness 60
+lovingcool-ctl off
 ```
 
-**Verified live on this machine**: installed the service, confirmed the
-process was genuinely running (`systemctl --user status`, real memory
-usage), `kill -9`'d it and confirmed systemd relaunched it with a new PID
-within seconds, confirmed `stop_service.sh` leaves it stopped (no
-respawn), then uninstalled and removed the test binary to leave the
-machine exactly as it was.
+Under the hood that's newline-delimited JSON on a user-only Unix socket
+(`$XDG_RUNTIME_DIR/lovingcool-control.sock`), e.g.
+`{"cmd": "show", "path": "/home/me/cat.gif"}`, so anything can drive it.
+
+Only one program can hold the serial port, so while the service runs the
+GUI can't connect to the device directly (it tells you so). Stop the
+service first (`systemctl --user stop lovingcool-control`) to use the GUI's
+LCD page or Screen Designer live mode; making the GUI a client of the
+service is the next step.
+
+```bash
+systemctl --user restart lovingcool-control
+journalctl --user -u lovingcool-control -f       # logs
+packaging/linux/uninstall_service.sh             # remove service + commands
+```
+
+### Windows
+
+Windows still uses the original approach (the GUI relaunched in a loop);
+the background service is Linux-only for now.
 
 **Windows — Task Scheduler + restart-loop wrapper** (`packaging/windows/`):
 

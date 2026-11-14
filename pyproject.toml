@@ -16,6 +16,10 @@ dependencies = [
     "wmi>=1.5.1; sys_platform == 'win32'",
 ]
 
+[project.scripts]
+lovingcool-controld = "lovingcool_control.service.daemon:main"
+lovingcool-ctl = "lovingcool_control.cli:main"
+
 [project.gui-scripts]
 lovingcool-control = "lovingcool_control.gui.app:main"
 

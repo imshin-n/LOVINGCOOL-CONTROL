@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 
 from lovingcool_control.core.device import AIODevice, DeviceError, find_any_cooler_candidates, find_devices
 from lovingcool_control.core.lcd import LCDController
+from lovingcool_control.service.server import default_socket_path, socket_is_live
 
 log = logging.getLogger(__name__)
 
@@ -195,8 +196,13 @@ class DevicePage(QWidget):
             )
             self.log_message.emit(f"[OK] Connected to {dev.spec.name}")
         except DeviceError as e:
-            self.log_message.emit(f"[ERROR] {e}")
-            self.status_text.setText(f"Connection failed: {e}")
+            msg = str(e)
+            if socket_is_live(default_socket_path()):
+                msg += ("\n\nThe background service (lovingcool-controld) is using the screen. "
+                        "Control it with lovingcool-ctl, or stop it first:\n"
+                        "  systemctl --user stop lovingcool-control")
+            self.log_message.emit(f"[ERROR] {msg}")
+            self.status_text.setText(f"Connection failed: {msg}")
 
     def _disconnect(self):
         if self._current_device:
