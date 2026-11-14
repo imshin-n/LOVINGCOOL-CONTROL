@@ -1,0 +1,39 @@
+# lovingcool-control :: packaging/linux/lovingcool-control.service
+# ==================================================
+# systemd --user unit — runs the built lovingcool-control executable, restarting
+# it automatically whenever it exits (window closed, crash, anything)
+# so the AIO display keeps running continuously. This is a *user* service
+# (not a system service) on purpose: it's a GUI app that needs the
+# logged-in session's DISPLAY/WAYLAND_DISPLAY — a system-level service
+# run as root/system would not have desktop access.
+#
+# Install with packaging/linux/install_service.sh (don't copy this by
+# hand unless you know what you're doing — the installer also imports
+# the session's display environment into systemd, which real GUI apps
+# need to actually show a window).
+#
+# To stop WITHOUT triggering the auto-restart loop:
+#   systemctl --user stop lovingcool-control
+# To resume:
+#   systemctl --user start lovingcool-control
+# To view logs:
+#   journalctl --user -u lovingcool-control -f
+
+[Unit]
+Description=lovingcool-control - Lovi.Cool AIO Controller
+After=graphical-session.target
+# Avoid a crash-loop hammering the USB device if something is
+# persistently broken: give up after 10 restarts within 60s, rather than
+# restarting forever at full speed (RestartSec still applies before that
+# limit is hit, so a normal "close and reopen" pattern is unaffected).
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/lovingcool-control/lovingcool-control
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
