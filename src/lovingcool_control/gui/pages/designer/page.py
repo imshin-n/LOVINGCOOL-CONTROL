@@ -52,8 +52,10 @@ from lovingcool_control.core.canvas import (
     scene_to_dict,
 )
 from lovingcool_control.core.device import user_config_dir
+from lovingcool_control.core.image_edit import is_editable
 from lovingcool_control.gui.bridge import ServiceBridge
 from lovingcool_control.gui.pages.device_view import ColorButton
+from lovingcool_control.gui.widgets.image_editor import ImageEditorDialog
 
 from .preview import ScenePreview
 from .widget_dialog import WidgetDialog, describe_widget
@@ -164,8 +166,12 @@ class ScreenDesignerPage(QWidget):
         self.bg_file.setPlaceholderText("No file selected")
         self.bg_browse = QPushButton("Browse…")
         self.bg_browse.clicked.connect(self._choose_bg_file)
+        self.bg_edit = QPushButton("Edit…")
+        self.bg_edit.setToolTip("Crop, rotate or adjust the picture without changing the original file")
+        self.bg_edit.clicked.connect(self._edit_bg_image)
         file_row.addWidget(self.bg_file, stretch=1)
         file_row.addWidget(self.bg_browse)
+        file_row.addWidget(self.bg_edit)
         self.file_label = QLabel("File:")
         bf.addRow(self.file_label, file_row)
         self.fit = QComboBox()
@@ -247,6 +253,8 @@ class ScreenDesignerPage(QWidget):
         has_file = self.bg_kind.currentData() != "color"
         for w in (self.file_label, self.bg_file, self.bg_browse, self.fit_label, self.fit):
             w.setVisible(has_file)
+        self.bg_edit.setVisible(self.bg_kind.currentData() in ("image", "gif"))
+        self.bg_edit.setEnabled(is_editable(self._bg_path))
         self._refresh_preview()
 
     def _choose_bg_file(self) -> None:
@@ -261,6 +269,19 @@ class ScreenDesignerPage(QWidget):
         self._bg_path = path
         self.bg_file.setText(Path(path).name if path else "")
         self.bg_file.setToolTip(path or "")
+        self.bg_edit.setEnabled(is_editable(path))
+
+    def _edit_bg_image(self) -> None:
+        if not is_editable(self._bg_path):
+            return
+        try:
+            dialog = ImageEditorDialog(self._bg_path, self._canvas_size(), self)
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Can't open this image for editing: {e}")
+            return
+        if dialog.exec() and dialog.result_path:
+            self._set_bg_path(dialog.result_path)
+            self._refresh_preview()
 
     def _sync_rotation(self, degrees: float) -> None:
         for w, value in ((self.rot_spin, degrees), (self.rot_slider, int(round(degrees * 10)))):

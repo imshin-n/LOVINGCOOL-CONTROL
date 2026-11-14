@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
 from lovingcool_control.core import sensors
 from lovingcool_control.core.canvas import background_preview_frame, load_scene, render_frame
 from lovingcool_control.core.device import user_config_dir
+from lovingcool_control.core.image_edit import is_editable
 from lovingcool_control.core.lcd import (
     VIDEO_EXTENSIONS,
     load_image,
@@ -43,6 +44,7 @@ from lovingcool_control.core.lcd import (
     render_text_image,
 )
 from lovingcool_control.gui.bridge import ServiceBridge
+from lovingcool_control.gui.widgets.image_editor import ImageEditorDialog
 from lovingcool_control.gui.widgets.preview import ScreenPreview
 
 log = logging.getLogger(__name__)
@@ -196,8 +198,13 @@ class DeviceView(QWidget):
         self.file_field.setPlaceholderText("No file selected")
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
+        self.edit_btn = QPushButton("Edit…")
+        self.edit_btn.setToolTip("Crop, rotate or adjust the picture without changing the original file")
+        self.edit_btn.clicked.connect(self._edit_image)
+        self.edit_btn.setEnabled(False)
         row.addWidget(self.file_field, stretch=1)
         row.addWidget(browse)
+        row.addWidget(self.edit_btn)
         f.addRow("File:", row)
         self.loop = QComboBox()
         self.loop.addItems(["Loop", "Play once"])
@@ -271,7 +278,26 @@ class DeviceView(QWidget):
         self._file = path
         self.file_field.setText(Path(path).name)
         self.file_field.setToolTip(path)
+        editable = is_editable(path)
+        self.edit_btn.setEnabled(editable)
+        self.edit_btn.setToolTip("Crop, rotate or adjust the picture without changing the original file"
+                                 if editable else "Videos can't be edited here")
         self._update_preview()
+
+    def _edit_image(self) -> None:
+        if not is_editable(self._file):
+            return
+        screen = logical_canvas_size(*self._panel_size(), self.orientation.currentData())
+        if self.rotation.currentData() in (90, 270):
+            screen = screen[::-1]
+        try:
+            dialog = ImageEditorDialog(self._file, screen, self)
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Can't open this image for editing: {e}")
+            return
+        if dialog.exec() and dialog.result_path:
+            self.set_file(dialog.result_path)
+            self.log_message.emit(f"[OK] Edited image saved as {Path(dialog.result_path).name}; press Apply to show it")
 
     def refresh_scenes(self, select: str | None = None) -> None:
         current = select or self.scene.currentData()

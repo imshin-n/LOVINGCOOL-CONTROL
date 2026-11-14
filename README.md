@@ -32,6 +32,9 @@ and isn't supported yet.
 
 - **Show anything**: images, GIFs and videos (any length or resolution;
   decoded on the fly), or a line of text in any colour and size.
+- **Built-in image editor**: crop a picture to the screen's shape, rotate,
+  flip, and adjust brightness, contrast and saturation without leaving the
+  app. Works on stills and animated GIFs; your original file is never changed.
 - **Screen Designer**: build a live dashboard by dragging widgets onto a
   background (colour, image, GIF or video): clock, date, CPU/GPU/RAM/disk
   usage and temperatures, network, battery, uptime, custom text and a CPU
@@ -100,9 +103,11 @@ follow the system), laid out like a desktop RGB-controller app:
 
 - **Devices**: your cooler as a tab on the left. A preview of the screen,
   a **Mode** list (Image / GIF / Video, Text, Scene, Off) with that mode's
-  options, orientation, rotation, brightness, and **Apply**.
+  options, orientation, rotation, brightness, and **Apply**. **Edit…** next
+  to the file opens the image editor; the edited copy is what gets shown.
 - **Screen Designer**: build a dashboard and press **Start Live**. Edits
-  you make while live appear on the screen within about half a second.
+  you make while live appear on the screen within about half a second. An
+  image or GIF background has the same **Edit…** button.
 - **Information**: device details, the service, other USB devices that
   might be an unrecognised cooler, and the event log.
 - **Settings**: theme, and where your settings and scenes live.
@@ -156,6 +161,7 @@ Every reply has `"ok": true` or `"ok": false, "error": "..."`.
 |---|---|
 | `~/.config/lovingcool-control/state.json` | What's showing and the brightness (restored on start) |
 | `~/.config/lovingcool-control/scenes/` | Screen Designer scenes, autosave and the live scene |
+| `~/.config/lovingcool-control/media/` | Edited copies of your images, each with a `.edit.json` holding its settings (open it in the editor again to change them) |
 | `~/.config/lovingcool-control/devices.toml` | Your own device entries (optional) |
 | `~/.config/lovingcool-control/lovingcool-control.conf` | GUI settings |
 

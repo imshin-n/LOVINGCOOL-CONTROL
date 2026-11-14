@@ -232,3 +232,29 @@ def test_theme_switch(qapp):
     assert qapp.palette().window().color().lightness() < 100
     assert apply_theme(qapp, "light") == "light"
     assert qapp.palette().window().color().lightness() > 150
+
+
+def test_edit_button_follows_the_chosen_file(env):
+    from PIL import Image
+
+    from lovingcool_control.gui.app import MainWindow
+
+    bridge = ServiceBridge(socket_path=env["sock"], runner_factory=env["factory"], poll_ms=100)
+    w = MainWindow(bridge)
+    try:
+        still = env["tmp"] / "pic.png"
+        Image.new("RGB", (64, 32), (200, 10, 10)).save(still)
+        view = w.device_view
+        view.set_file(str(still))
+        assert view.edit_btn.isEnabled()
+        view.set_file(str(env["tmp"] / "clip.mp4"))
+        assert not view.edit_btn.isEnabled()
+
+        designer = w.designer
+        designer.bg_kind.setCurrentIndex(designer.bg_kind.findData("image"))
+        designer._set_bg_path(str(still))
+        assert designer.bg_edit.isEnabled() and not designer.bg_edit.isHidden()
+        designer.bg_kind.setCurrentIndex(designer.bg_kind.findData("video"))
+        assert designer.bg_edit.isHidden()
+    finally:
+        w.close()
