@@ -2,12 +2,13 @@
 # lovingcool-control :: packaging/linux/install_service.sh
 # ========================================================
 # Installs the commands (lovingcool-controld, lovingcool-ctl, lovingcool-control)
-# into ~/.local/bin with `uv tool install`, then installs and starts the
-# systemd --user service. Safe to re-run to upgrade after pulling changes.
+# into ~/.local/bin with `uv tool install`, adds the app to your launcher
+# (desktop entry + icon), then installs and starts the systemd --user
+# service. Safe to re-run to upgrade after pulling changes.
 #
-# If the old "lovi-ctrl" service from the original project is installed, it
-# is stopped and disabled (it would fight over the screen); pass
-# --remove-old to also delete its unit file and ~/.local/share/lovi-ctrl.
+# If the original project's "lovi-ctrl" is installed, its service is stopped
+# and disabled (it would fight over the screen); pass --remove-old to also
+# delete its unit file, its "LoviCtrl" launcher entry and ~/.local/share/lovi-ctrl.
 #
 # Usage:
 #   packaging/linux/install_service.sh [--remove-old]
@@ -20,22 +21,35 @@ REMOVE_OLD=0
 
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT=lovingcool-control.service
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+APPS_DIR="$DATA_HOME/applications"
+ICON_DIR="$DATA_HOME/icons/hicolor/scalable/apps"
+OLD_DESKTOP="$APPS_DIR/lovi-ctrl.desktop"
 
 command -v uv >/dev/null || { echo "[ERROR] uv not found: https://docs.astral.sh/uv/" >&2; exit 1; }
 
 echo "==> Installing commands with uv tool (into ~/.local/bin)"
 uv tool install --force --reinstall .
 
-if systemctl --user cat lovi-ctrl.service >/dev/null 2>&1; then
-    echo "==> Disabling the old lovi-ctrl service"
+echo "==> Adding the app to your launcher"
+install -Dm644 src/lovingcool_control/gui/icon.svg "$ICON_DIR/lovingcool-control.svg"
+# Launchers don't always have ~/.local/bin on PATH, so point at it directly.
+sed "s|^Exec=.*|Exec=$HOME/.local/bin/lovingcool-control|" packaging/linux/lovingcool-control.desktop |
+    install -Dm644 /dev/stdin "$APPS_DIR/lovingcool-control.desktop"
+command -v update-desktop-database >/dev/null && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$DATA_HOME/icons/hicolor" 2>/dev/null || true
+
+if systemctl --user cat lovi-ctrl.service >/dev/null 2>&1 || [ -e "$OLD_DESKTOP" ] || [ -d "$HOME/.local/share/lovi-ctrl" ]; then
+    echo "==> Found the original lovi-ctrl"
     systemctl --user disable --now lovi-ctrl.service 2>/dev/null || true
     systemctl --user reset-failed lovi-ctrl.service 2>/dev/null || true
     if [ "$REMOVE_OLD" = 1 ]; then
-        rm -f "$UNIT_DIR/lovi-ctrl.service"
+        rm -f "$UNIT_DIR/lovi-ctrl.service" "$OLD_DESKTOP"
         rm -rf "$HOME/.local/share/lovi-ctrl"
-        echo "    removed its unit file and ~/.local/share/lovi-ctrl"
+        echo "    removed its service, its LoviCtrl launcher entry and ~/.local/share/lovi-ctrl"
     else
-        echo "    (left its files; re-run with --remove-old to delete them)"
+        echo "    service disabled; its LoviCtrl launcher entry still starts the OLD app."
+        echo "    Re-run with --remove-old to delete it and its files."
     fi
 fi
 
