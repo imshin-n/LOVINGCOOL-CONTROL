@@ -167,6 +167,7 @@ class MainWindow(QMainWindow):
         self.device_view.edit_scene_requested.connect(lambda: self.tabs.setCurrentWidget(self.designer))
         self.settings_page.theme_changed.connect(self._apply_theme)
         self.tabs.currentChanged.connect(lambda _i: self.refresh_scenes())
+        self.designer.scene_file_changed.connect(self.select_scene)
 
         self.refresh_scenes()
         self.tabs.setCurrentIndex(int(self._settings.value("window/tab", 0)))
@@ -176,6 +177,18 @@ class MainWindow(QMainWindow):
         self.bridge.start()
 
     # ── Bottom bar ───────────────────────────────────────────
+
+    def select_scene(self, path: str) -> None:
+        """Make a scene file the bottom bar's choice, so Show Scene shows it."""
+        self.refresh_scenes()
+        index = self.scene_combo.findData(str(Path(path)))
+        if index < 0 and Path(path).is_file():   # saved outside the scenes folder
+            self.scene_combo.addItem(Path(path).stem, str(Path(path)))
+            self.scene_combo.setEnabled(True)
+            self.btn_load_scene.setEnabled(True)
+            index = self.scene_combo.count() - 1
+        if index >= 0:
+            self.scene_combo.setCurrentIndex(index)
 
     def refresh_scenes(self) -> None:
         current = self.scene_combo.currentData()

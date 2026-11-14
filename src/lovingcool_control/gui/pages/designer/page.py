@@ -90,6 +90,7 @@ def _rgb(c: QColor) -> tuple[int, int, int]:
 
 class ScreenDesignerPage(QWidget):
     log_message = pyqtSignal(str)
+    scene_file_changed = pyqtSignal(str)   # a scene file was opened or saved: the bottom bar selects it
 
     def __init__(self, bridge: ServiceBridge):
         super().__init__()
@@ -522,6 +523,7 @@ class ScreenDesignerPage(QWidget):
         try:
             self._apply_scene(load_scene(path))
             self.log_message.emit(f"[OK] Opened scene {Path(path).stem}")
+            self.scene_file_changed.emit(path)
         except Exception as e:
             self.log_message.emit(f"[ERROR] Could not open scene: {e}")
             QMessageBox.warning(self, "Couldn't open scene", str(e))
@@ -534,5 +536,6 @@ class ScreenDesignerPage(QWidget):
         try:
             save_scene(self._build_scene_config(), path)
             self.log_message.emit(f"[OK] Saved scene {Path(path).stem}")
+            self.scene_file_changed.emit(path)
         except OSError as e:
             self.log_message.emit(f"[ERROR] Could not save scene: {e}")

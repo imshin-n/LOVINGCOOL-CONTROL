@@ -258,3 +258,31 @@ def test_edit_button_follows_the_chosen_file(env):
         assert designer.bg_edit.isHidden()
     finally:
         w.close()
+
+
+def test_designer_save_as_becomes_the_scene_to_show(env, monkeypatch):
+    """Saving from the designer selects that scene in the bottom bar, not the first one alphabetically."""
+    from lovingcool_control.core.canvas import SceneConfig, save_scene
+    from lovingcool_control.gui.app import MainWindow
+    from lovingcool_control.gui.pages.designer import page as page_mod
+    from lovingcool_control.gui.pages.device_view import scenes_dir
+
+    scenes_dir().mkdir(parents=True)
+    save_scene(SceneConfig(), scenes_dir() / "Aaa.json")
+    target = scenes_dir() / "Zzz.json"
+    monkeypatch.setattr(page_mod.QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+
+    bridge = ServiceBridge(socket_path=env["sock"], runner_factory=env["factory"], poll_ms=100)
+    w = MainWindow(bridge)
+    try:
+        assert wait_until(lambda: bridge.connected)
+        assert w.scene_combo.currentText() == "Aaa"
+        w.designer._save_scene_as()
+        assert target.is_file()
+        assert w.scene_combo.currentText() == "Zzz"
+        w.tabs.setCurrentIndex(0)                       # switching tabs keeps the choice
+        assert w.scene_combo.currentText() == "Zzz"
+        w._show_scene()
+        assert wait_until(lambda: (bridge.status.get("path") or "").endswith("Zzz.json"))
+    finally:
+        w.close()
