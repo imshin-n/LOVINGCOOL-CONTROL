@@ -74,6 +74,9 @@ class DeviceSpec:
     cmd_get_info: int = 0x06
     cmd_commit: int = 0x11        # "start live", sent once before streaming frames
     cmd_close: int = 0x21
+    # Some firmware (SC60, v3.1) blanks the panel ~0.5 s after the last frame.
+    # When > 0, LCDController re-sends the last frame this often (ms) while idle.
+    keepalive_ms: int = 0
     tags: list[str] = field(default_factory=list)
     verified: bool = False
 

@@ -124,3 +124,43 @@ def test_pace_frames_shows_everything_when_fast_enough():
     pace_frames([(i, 40) for i in range(25)], FakeStop(clock), shown.append, clock=clock)
     assert shown == list(range(25))
     assert abs(clock.t - 1.0) < 1e-9
+
+
+def test_keepalive_resends_last_frame_until_stop(make_device):
+    d, fake = make_device(keepalive_ms=40)
+    ctl = LCDController.for_device(d)
+    ctl._info_loaded = True
+    ctl.send_image(Image.new("RGB", (10, 10)))
+    frame = fake.writes[-1]
+    time.sleep(0.3)
+    resent = fake.writes[2:]
+    assert len(resent) >= 3 and all(w == frame for w in resent)
+    ctl.stop()
+    count = len(fake.writes)
+    time.sleep(0.15)
+    assert len(fake.writes) == count            # nothing after stop
+
+
+def test_no_keepalive_by_default(make_device):
+    _, fake, ctl = controller(make_device)
+    ctl.send_image(Image.new("RGB", (10, 10)))
+    time.sleep(0.15)
+    assert len(fake.writes) == 2                 # commit + one frame
+
+
+def test_command_mid_stream_ends_and_resumes_stream(make_device):
+    d, fake = make_device(keepalive_ms=10_000)
+    ctl = LCDController.for_device(d)
+    ctl._info_loaded = True
+    ctl._use_frame_wrapper = True                # firmware > 2.8 behaviour
+    ctl.send_image(Image.new("RGB", (10, 10)))
+    frame = fake.writes[-1]
+    fake.writes.clear()
+    ctl.set_brightness(55)
+    assert fake.writes == [
+        b"\xff\xd9\xff\xd9",                     # end the stream so the command is heard
+        build_frame(0x03, bytes([55])),
+        build_frame(0x11),                       # start live again
+        frame,                                   # and put the picture back
+    ]
+    ctl.stop()

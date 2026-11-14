@@ -180,6 +180,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self._current_device:
             LCDController.for_device(self._current_device).stop_playback()
+            try:
+                LCDController.for_device(self._current_device).stop()   # end the stream cleanly
+            except Exception:
+                pass
             self._current_device.disconnect()
         event.accept()
 

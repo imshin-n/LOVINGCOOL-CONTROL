@@ -291,6 +291,11 @@ class LCDController:
         self._max_jpeg_kb = self.DEFAULT_MAX_JPEG_KB
         self._jpeg_quality_hint: int | None = None
         self._info_loaded = False
+        # Keep-alive: last frame as sent on the wire, and when anything was last sent.
+        self._last_wire: bytes | None = None
+        self._last_send = 0.0
+        self._keepalive_thread: threading.Thread | None = None
+        self._keepalive_stop = threading.Event()
         # Playback (one at a time)
         self._play_thread: threading.Thread | None = None
         self._play_stop = threading.Event()
@@ -306,7 +311,16 @@ class LCDController:
 
     def refresh_info(self) -> dict:
         """Query the device; sets panel size (via the device) and firmware-dependent framing."""
-        info = self.device.get_info() if self.device.spec.transport == "serial" else {}
+        info = {}
+        if self.device.spec.transport == "serial":
+            with self.device.exclusive():
+                was_live = self._live_started
+                self._end_stream()
+                try:
+                    info = self.device.get_info()
+                finally:
+                    if was_live and self._last_wire is not None and self.device.connected:
+                        self._send_wire(self._last_wire)
         match = re.search(r"\d+(?:\.\d+)?", str(info.get("version", "")))
         version = float(match.group()) if match else None
         self._use_frame_wrapper = version is not None and version > 2.8
@@ -328,11 +342,48 @@ class LCDController:
 
     def send_raw_jpeg_frame(self, jpeg_bytes: bytes) -> None:
         """Send one already-encoded JPEG (commit first if this live session hasn't)."""
+        self._send_wire(self._build_jpeg_frame(jpeg_bytes))
+
+    def _send_wire(self, wire: bytes) -> None:
         with self.device.exclusive():
             if not self._live_started:
                 self.device.send_command(self.device.spec.cmd_commit, expect_response=False)
                 self._live_started = True
-            self.device.send_packet(self._build_jpeg_frame(jpeg_bytes))
+            self.device.send_packet(wire)
+            self._last_wire = wire
+            self._last_send = time.monotonic()
+        self._ensure_keepalive()
+
+    # ── Keep-alive (firmware that blanks without a steady stream) ──
+
+    def _ensure_keepalive(self) -> None:
+        if self.device.spec.keepalive_ms <= 0:
+            return
+        if (self._keepalive_thread and self._keepalive_thread.is_alive()
+                and not self._keepalive_stop.is_set()):
+            return
+        # A fresh event per thread: a previous thread that is still winding down
+        # after stop() keeps its own (set) event and can't cancel this one.
+        stop = self._keepalive_stop = threading.Event()
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, args=(stop,),
+                                                  daemon=True, name="lcd-keepalive")
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self, stop: threading.Event) -> None:
+        """Re-send the last frame whenever nothing else has been sent for keepalive_ms."""
+        period = self.device.spec.keepalive_ms / 1000.0
+        while not stop.wait(period / 4):
+            with self.device.exclusive():
+                if not self._live_started or self._last_wire is None or not self.device.connected:
+                    return
+                if time.monotonic() - self._last_send < period:
+                    continue
+                try:
+                    self.device.send_packet(self._last_wire)
+                except DeviceError as e:
+                    log.warning("Keep-alive stopped: %s", e)
+                    return
+                self._last_send = time.monotonic()
 
     def send_raw_frame(self, pixel_data: bytes) -> None:
         """Legacy chunked raw-pixel transmission (unverified; see class docstring)."""
@@ -345,11 +396,40 @@ class LCDController:
                 self.device.send_packet((header + pixel_data[offset:offset + chunk_size]).ljust(64, b"\0"))
 
     def stop(self) -> None:
-        """End the live session; the next frame re-sends the commit."""
-        if self._use_frame_wrapper and self.device.connected:
+        """End the live session (stops the keep-alive); the next frame re-sends the commit."""
+        self._keepalive_stop.set()
+        with self.device.exclusive():
+            self._end_stream()
+            self._last_wire = None
+
+    def _end_stream(self) -> None:
+        if self._live_started and self._use_frame_wrapper and self.device.connected:
             # The vendor app resets the image stream with a double JPEG EOI.
             self.device.send_packet(bytes([0xFF, 0xD9, 0xFF, 0xD9]))
         self._live_started = False
+
+    # ── Commands while streaming ──────────────────────────────
+
+    def command(self, key: int, payload: bytes = b"", expect_response: bool = True) -> dict | None:
+        """
+        Send a command-channel frame, safely even mid-stream. Firmware 3.x
+        ignores commands while a JPEG stream is open, so the stream is ended
+        first and the last frame re-sent afterwards (the panel only blanks
+        after ~0.5 s without frames, so this doesn't flicker).
+        """
+        with self.device.exclusive():
+            was_live = self._live_started
+            self._end_stream()
+            try:
+                return self.device.send_command(key, payload, expect_response=expect_response)
+            finally:
+                if was_live and self._last_wire is not None and self.device.connected:
+                    self._send_wire(self._last_wire)
+
+    def set_brightness(self, percent: int) -> None:
+        """LCD backlight, 0-100."""
+        self.command(self.device.spec.cmd_set_brightness, bytes([max(0, min(100, percent))]),
+                     expect_response=False)
 
     # ── Frames ────────────────────────────────────────────────
 

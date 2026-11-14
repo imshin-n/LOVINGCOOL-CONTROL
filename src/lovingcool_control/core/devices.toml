@@ -17,6 +17,8 @@
 #   lcd_color_format   "JPEG" | "RGB565" | "BGR565" | "RGB888"  ["RGB565"]
 #   packet_size, report_id, interface   HID only
 #   cmd_*              command-channel opcodes (see core/protocol.py)
+#   keepalive_ms       re-send the last frame this often while idle, for
+#                      firmware that blanks without a steady stream [0 = off]
 #   tags               free-form labels
 #   verified           true once confirmed on real hardware [false]
 
@@ -37,19 +39,24 @@ lcd_color_format = "JPEG"
 tags = ["lcd"]
 verified = true
 
-# Lovingcool SC60, 4" square panel. Same vendor firmware family.
+# Lovingcool SC60, 4" square panel. Confirmed live 2026-11-14:
+#   {"width":480,"height":480,"model":"TXW818-ST7701S-4.0inch","version":"3.1","angle":270}
+# Firmware 3.1 (> 2.8) uses the length+checksum frame wrapper. Works with DTR
+# on or off; on matches the vendor app. The panel blanks ~0.5 s after the last
+# frame and ignores commands while a stream is open (LCDController handles both).
 [[device]]
 name = "Lovingcool SC60 4.0-inch"
 vid = 0x33c3
 pid = 0x7791
 transport = "serial"
 baudrate = 2_000_000
-dtr = false
+dtr = true
 lcd_width = 480
 lcd_height = 480
 lcd_color_format = "JPEG"
 tags = ["lcd"]
-verified = false
+keepalive_ms = 200
+verified = true
 
 # The vendor app also whitelists PID 0x7797 on the same VID for sibling
 # brand builds; probably the same protocol, never tested:
