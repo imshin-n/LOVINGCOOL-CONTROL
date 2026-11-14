@@ -51,6 +51,7 @@ from lovingcool_control.core.canvas import (
     logical_canvas_size,
     render_frame,
     save_scene,
+    scene_metric_keys,
     scene_to_dict,
 )
 from lovingcool_control.core.device import user_config_dir
@@ -99,6 +100,7 @@ class ScreenDesignerPage(QWidget):
         self._pending_since = 0.0
         self._last_autosaved: dict | None = None
         self._push_in_flight = False
+        self._preview_key = None
 
         self._build_ui()
         self.preview.bind_widgets(self._widgets)
@@ -498,23 +500,34 @@ class ScreenDesignerPage(QWidget):
 
     # ── Preview, live sync and autosave ──────────────────────
 
-    def _refresh_preview(self):
+    def _refresh_preview(self, data: dict | None = None):
         cfg = self._build_scene_config()
+        data = data if data is not None else scene_to_dict(cfg)
         w, h = self._canvas_size()
         source = "from the connected panel" if self.bridge.connected else "last known panel size"
         self.canvas_size_label.setText(f"Canvas: {w} x {h} ({self._orientation}, {source})")
         try:
+            metrics = sensors.read_all(scene_metric_keys(cfg))   # once, shared with hit-testing
+            # Redraw only when something visible changed: the scene, a stat's text
+            # (stats refresh once a second), the selection or the panel size.
+            key = (repr(data), tuple(sorted((k, m.display) for k, m in metrics.items())),
+                   self.preview.selected_index, self._device_native_size())
+            if key == self._preview_key:
+                return
             bg = background_preview_frame(cfg.background)
             frame = render_frame(cfg, *self._device_native_size(), bg, self._preview_history,
-                                 highlight_index=self.preview.selected_index, for_device=False)
-            self.preview.set_image(frame, metrics=sensors.read_all())
+                                 highlight_index=self.preview.selected_index, for_device=False,
+                                 metrics=metrics)
+            self.preview.set_image(frame, metrics=metrics)
+            self._preview_key = key
         except Exception as e:
+            self._preview_key = None
             self.log_message.emit(f"[ERROR] Preview failed: {e}")
 
     def _tick(self):
-        if self.isVisible():
-            self._refresh_preview()
         data = scene_to_dict(self._build_scene_config())
+        if self.isVisible():
+            self._refresh_preview(data)
         if data != self._last_autosaved:
             self._autosave(data)
         if self._is_live() and data != self._last_pushed and not self._push_in_flight:

@@ -1,17 +1,22 @@
 """
 lovingcool-control :: core/sensors.py
-==============================
-Hardware monitoring for the Screen Designer's stat widgets (CPU/GPU
-usage & temperature, RAM, disk, network, battery, uptime, clock).
+=====================================
+System stats for the Screen Designer's widgets: CPU/GPU usage and
+temperature, CPU frequency, RAM, disk, network, battery, uptime, clock.
 
-Cross-platform via psutil where psutil supports it. A few metrics
-(temperature sensors, fan speed) are Linux/macOS-only in psutil itself —
-on Windows those fall back to a best-effort WMI query (optional `wmi`
-package) and simply report "N/A" if that's not available either, rather
-than crashing. Every metric degrades gracefully like this: missing
-psutil, missing wmi, missing nvidia-smi, or a platform that just doesn't
-expose a given sensor all result in Metric.available=False, never an
-exception surfacing to the GUI.
+Built to be cheap, because a live scene asks several times a second:
+
+- Only the stats a scene actually shows are read (read(keys)).
+- Values other than the clock are refreshed at most once a second
+  (REFRESH_S); faster than that just repeats the same numbers.
+- On Linux the CPU and GPU sensors are located once in /sys and then read
+  as a single small file each, instead of psutil.sensors_temperatures(),
+  which reads every sensor on the machine (~85 files here) per call.
+- GPU: NVIDIA via nvidia-smi (throttled like everything else), AMD via
+  sysfs (gpu_busy_percent and the card's hwmon "edge" temperature).
+
+Every stat degrades to "N/A" (Metric.available=False) when the platform,
+hardware or an optional package doesn't provide it; nothing here raises.
 """
 
 from __future__ import annotations
@@ -23,10 +28,12 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 IS_WINDOWS = platform.system() == "Windows"
+REFRESH_S = 1.0
 
 try:
     import psutil
@@ -34,18 +41,10 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
-_WMI_AVAILABLE = False
-if IS_WINDOWS:
-    try:
-        import wmi
-        _WMI_AVAILABLE = True
-    except ImportError:
-        _WMI_AVAILABLE = False
-
-_NVIDIA_SMI = shutil.which("nvidia-smi")
-
-# Common CPU-package temperature sensor labels, in priority order (Linux hwmon naming).
-_CPU_TEMP_HINTS = ["tctl", "package id 0", "cpu package", "tdie", "core 0", "cpu"]
+# CPU temperature drivers, best first, with the sensor label to prefer in each.
+_CPU_HWMON = [("k10temp", ("tctl", "tdie")), ("zenpower", ("tdie", "tctl")),
+              ("coretemp", ("package id 0",)), ("cpu_thermal", ()), ("acpitz", ())]
+_CPU_TEMP_HINTS = ["tctl", "package id 0", "cpu package", "tdie", "core 0", "cpu"]   # psutil fallback
 
 
 @dataclass
@@ -65,149 +64,6 @@ class Metric:
         return f"{self.value}{self.unit}"
 
 
-# ── Individual metric readers (each fully self-guarded) ──────────
-
-def _cpu_temp_c() -> float | None:
-    if PSUTIL_AVAILABLE:
-        try:
-            temps = psutil.sensors_temperatures()   # AttributeError on Windows/some macOS
-        except Exception:
-            temps = None
-        if temps:
-            candidates = [e for entries in temps.values() for e in entries if e.current]
-            for hint in _CPU_TEMP_HINTS:
-                for e in candidates:
-                    if hint in (e.label or "").lower():
-                        return e.current
-            if candidates:
-                return candidates[0].current
-
-    if _WMI_AVAILABLE:
-        # Best-effort: many Windows systems don't expose this without
-        # LibreHardwareMonitor/OpenHardwareMonitor running as a WMI provider.
-        try:
-            w = wmi.WMI(namespace="root\\WMI")
-            zones = w.MSAcpi_ThermalZoneTemperature()
-            if zones:
-                # value is in tenths of Kelvin
-                return (zones[0].CurrentTemperature / 10.0) - 273.15
-        except Exception:
-            pass
-    return None
-
-
-def _gpu_stats() -> tuple[float | None, float | None]:
-    """Returns (utilization_percent, temperature_c) via nvidia-smi, or (None, None)."""
-    if not _NVIDIA_SMI:
-        return None, None
-    try:
-        out = subprocess.run(
-            [_NVIDIA_SMI, "--query-gpu=utilization.gpu,temperature.gpu",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if out.returncode != 0:
-            return None, None
-        util_str, temp_str = out.stdout.strip().split(",")
-        return float(util_str.strip()), float(temp_str.strip())
-    except Exception:
-        return None, None
-
-
-def _disk_percent() -> float | None:
-    if not PSUTIL_AVAILABLE:
-        return None
-    try:
-        path = "C:\\" if IS_WINDOWS else "/"
-        return psutil.disk_usage(path).percent
-    except Exception:
-        return None
-
-
-def _battery_percent() -> float | None:
-    if not PSUTIL_AVAILABLE:
-        return None
-    try:
-        battery = psutil.sensors_battery()
-        return battery.percent if battery else None
-    except Exception:
-        return None
-
-
-def _net_totals_gb() -> tuple[float | None, float | None]:
-    if not PSUTIL_AVAILABLE:
-        return None, None
-    try:
-        io = psutil.net_io_counters()
-        return io.bytes_sent / 1e9, io.bytes_recv / 1e9
-    except Exception:
-        return None, None
-
-
-def _uptime_str() -> str | None:
-    if not PSUTIL_AVAILABLE:
-        return None
-    try:
-        delta = timedelta(seconds=time.time() - psutil.boot_time())
-        hours, remainder = divmod(int(delta.total_seconds()), 3600)
-        minutes = remainder // 60
-        return f"{hours}h {minutes}m"
-    except Exception:
-        return None
-
-
-def _cpu_freq_ghz() -> float | None:
-    if not PSUTIL_AVAILABLE:
-        return None
-    try:
-        freq = psutil.cpu_freq()
-        return freq.current / 1000.0 if freq else None
-    except Exception:
-        return None
-
-
-def read_all() -> dict[str, Metric]:
-    """Snapshot every supported metric right now."""
-    now = datetime.now()
-    metrics: dict[str, Metric] = {
-        "clock": Metric("clock", "Clock", "", True, now.strftime("%H:%M:%S")),
-        "date": Metric("date", "Date", "", True, now.strftime("%Y-%m-%d")),
-    }
-
-    def _m(key: str, label: str, unit: str, value):
-        metrics[key] = Metric(key, label, unit, value is not None, value)
-
-    if PSUTIL_AVAILABLE:
-        try:
-            _m("cpu_percent", "CPU", "%", psutil.cpu_percent(interval=None))
-        except Exception:
-            _m("cpu_percent", "CPU", "%", None)
-        try:
-            _m("ram_percent", "RAM", "%", psutil.virtual_memory().percent)
-        except Exception:
-            _m("ram_percent", "RAM", "%", None)
-    else:
-        _m("cpu_percent", "CPU", "%", None)
-        _m("ram_percent", "RAM", "%", None)
-
-    _m("cpu_temp", "CPU Temp", "°C", _cpu_temp_c())
-
-    gpu_util, gpu_temp = _gpu_stats()
-    _m("gpu_percent", "GPU", "%", gpu_util)
-    _m("gpu_temp", "GPU Temp", "°C", gpu_temp)
-
-    _m("disk_percent", "Disk", "%", _disk_percent())
-    _m("battery_percent", "Battery", "%", _battery_percent())
-    _m("cpu_freq", "CPU Freq", " GHz", _cpu_freq_ghz())
-    _m("uptime", "Uptime", "", _uptime_str())
-
-    net_sent, net_recv = _net_totals_gb()
-    _m("net_sent", "Net Sent", " GB", net_sent)
-    _m("net_recv", "Net Recv", " GB", net_recv)
-
-    return metrics
-
-
 METRIC_CHOICES = [
     ("clock", "Clock (HH:MM:SS)"),
     ("date", "Date"),
@@ -223,10 +79,236 @@ METRIC_CHOICES = [
     ("net_recv", "Network Received (total)"),
     ("uptime", "System Uptime"),
 ]
+ALL_KEYS = frozenset(k for k, _ in METRIC_CHOICES)
+
+_LABELS = {
+    "clock": ("Clock", ""), "date": ("Date", ""), "cpu_percent": ("CPU", "%"), "cpu_temp": ("CPU Temp", "°C"),
+    "cpu_freq": ("CPU Freq", " GHz"), "ram_percent": ("RAM", "%"), "disk_percent": ("Disk", "%"),
+    "gpu_percent": ("GPU", "%"), "gpu_temp": ("GPU Temp", "°C"), "battery_percent": ("Battery", "%"),
+    "net_sent": ("Net Sent", " GB"), "net_recv": ("Net Recv", " GB"), "uptime": ("Uptime", ""),
+}
+
+
+def _read_number(path: Path | None) -> float | None:
+    if path is None:
+        return None
+    try:
+        return float(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+class Sensors:
+    """
+    Reads stats on demand, with per-stat caching. One instance per consumer
+    is fine; locating sensors happens once per instance.
+    """
+
+    def __init__(self, sys_root: Path = Path("/sys"), refresh_s: float = REFRESH_S):
+        self.sys_root = sys_root
+        self.refresh_s = refresh_s
+        self._cache: dict[str, tuple[float, object]] = {}
+        self._located = False
+        self._cpu_temp_path: Path | None = None
+        self._amd_busy_path: Path | None = None
+        self._amd_temp_path: Path | None = None
+        self._nvidia_smi = shutil.which("nvidia-smi")
+
+    # ── Locating sensors (once) ───────────────────────────────
+
+    def _locate(self) -> None:
+        if self._located:
+            return
+        self._located = True
+        if IS_WINDOWS:
+            return
+        self._cpu_temp_path = self._find_cpu_temp()
+        self._amd_busy_path, self._amd_temp_path = self._find_amd_gpu()
+        log.debug("CPU temp: %s, AMD GPU: %s / %s", self._cpu_temp_path, self._amd_busy_path, self._amd_temp_path)
+
+    def _find_cpu_temp(self) -> Path | None:
+        hwmons = {}
+        for d in sorted((self.sys_root / "class/hwmon").glob("hwmon*")):
+            try:
+                hwmons.setdefault((d / "name").read_text().strip(), d)
+            except OSError:
+                continue
+        for driver, labels in _CPU_HWMON:
+            d = hwmons.get(driver)
+            if d is None:
+                continue
+            inputs = sorted(d.glob("temp*_input"))
+            for want in labels:
+                for inp in inputs:
+                    label = inp.with_name(inp.name.replace("_input", "_label"))
+                    try:
+                        if label.read_text().strip().lower() == want:
+                            return inp
+                    except OSError:
+                        continue
+            if inputs:
+                return inputs[0]
+        return None
+
+    def _find_amd_gpu(self) -> tuple[Path | None, Path | None]:
+        """The AMD card with the most VRAM (the discrete one, if there's also an iGPU)."""
+        best: tuple[int, Path] | None = None
+        for card in (self.sys_root / "class/drm").glob("card[0-9]*"):
+            dev = card / "device"
+            busy = dev / "gpu_busy_percent"
+            if "-" in card.name or not busy.exists():
+                continue
+            vram = int(_read_number(dev / "mem_info_vram_total") or 0)
+            if best is None or vram > best[0]:
+                best = (vram, dev)
+        if best is None:
+            return None, None
+        dev = best[1]
+        temp = None
+        for inp in sorted(dev.glob("hwmon/hwmon*/temp*_input")):
+            label = inp.with_name(inp.name.replace("_input", "_label"))
+            try:
+                if label.read_text().strip().lower() == "edge":
+                    temp = inp
+                    break
+            except OSError:
+                pass
+            temp = temp or inp
+        return dev / "gpu_busy_percent", temp
+
+    # ── Individual readers ────────────────────────────────────
+
+    def _cpu_temp(self) -> float | None:
+        if self._cpu_temp_path is not None:
+            v = _read_number(self._cpu_temp_path)
+            return v / 1000.0 if v is not None else None
+        if IS_WINDOWS:
+            return _wmi_cpu_temp()
+        if PSUTIL_AVAILABLE and hasattr(psutil, "sensors_temperatures"):   # e.g. unusual drivers
+            try:
+                temps = psutil.sensors_temperatures()
+            except Exception:
+                return None
+            candidates = [e for entries in temps.values() for e in entries if e.current]
+            for hint in _CPU_TEMP_HINTS:
+                for e in candidates:
+                    if hint in (e.label or "").lower():
+                        return e.current
+            return candidates[0].current if candidates else None
+        return None
+
+    def _gpu(self) -> tuple[float | None, float | None]:
+        if self._amd_busy_path is not None:
+            busy = _read_number(self._amd_busy_path)
+            temp = _read_number(self._amd_temp_path)
+            return busy, (temp / 1000.0 if temp is not None else None)
+        if self._nvidia_smi:
+            try:
+                out = subprocess.run([self._nvidia_smi, "--query-gpu=utilization.gpu,temperature.gpu",
+                                      "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
+                if out.returncode == 0:
+                    util, temp = out.stdout.strip().splitlines()[0].split(",")
+                    return float(util), float(temp)
+            except Exception:
+                pass
+        return None, None
+
+    def _compute(self, key: str):
+        """Fresh value for one key (None when unavailable). Paired keys share a reading."""
+        try:
+            if key == "cpu_percent":
+                return psutil.cpu_percent(interval=None) if PSUTIL_AVAILABLE else None
+            if key == "ram_percent":
+                return psutil.virtual_memory().percent if PSUTIL_AVAILABLE else None
+            if key == "cpu_temp":
+                return self._cpu_temp()
+            if key == "cpu_freq":
+                f = psutil.cpu_freq() if PSUTIL_AVAILABLE else None
+                return f.current / 1000.0 if f else None
+            if key == "disk_percent":
+                return psutil.disk_usage("C:\\" if IS_WINDOWS else "/").percent if PSUTIL_AVAILABLE else None
+            if key == "battery_percent":
+                b = psutil.sensors_battery() if PSUTIL_AVAILABLE and hasattr(psutil, "sensors_battery") else None
+                return b.percent if b else None
+            if key == "uptime":
+                if not PSUTIL_AVAILABLE:
+                    return None
+                secs = int((timedelta(seconds=time.time() - psutil.boot_time())).total_seconds())
+                return f"{secs // 3600}h {(secs % 3600) // 60}m"
+        except Exception:
+            return None
+        return None
+
+    def _pair(self, a: str, b: str, fn) -> None:
+        now = time.monotonic()
+        cached = self._cache.get(a)
+        if cached and now - cached[0] < self.refresh_s:
+            return
+        try:
+            va, vb = fn()
+        except Exception:
+            va = vb = None
+        self._cache[a] = (now, va)
+        self._cache[b] = (now, vb)
+
+    def _value(self, key: str):
+        if key in ("gpu_percent", "gpu_temp"):
+            self._pair("gpu_percent", "gpu_temp", self._gpu)
+            return self._cache[key][1]
+        if key in ("net_sent", "net_recv"):
+            def net():
+                io = psutil.net_io_counters()
+                return io.bytes_sent / 1e9, io.bytes_recv / 1e9
+            self._pair("net_sent", "net_recv", net if PSUTIL_AVAILABLE else (lambda: (None, None)))
+            return self._cache[key][1]
+        now = time.monotonic()
+        cached = self._cache.get(key)
+        if cached and now - cached[0] < self.refresh_s:
+            return cached[1]
+        value = self._compute(key)
+        self._cache[key] = (now, value)
+        return value
+
+    # ── Public ────────────────────────────────────────────────
+
+    def read(self, keys=None) -> dict[str, Metric]:
+        """Metrics for `keys` (all of them if None). The clock and date are always current."""
+        self._locate()
+        keys = ALL_KEYS if keys is None else (set(keys) & ALL_KEYS)
+        now = datetime.now()
+        out: dict[str, Metric] = {}
+        for key in keys:
+            label, unit = _LABELS[key]
+            if key == "clock":
+                value = now.strftime("%H:%M:%S")
+            elif key == "date":
+                value = now.strftime("%Y-%m-%d")
+            else:
+                value = self._value(key)
+            out[key] = Metric(key, label, unit, value is not None, value)
+        return out
+
+
+def _wmi_cpu_temp() -> float | None:
+    """Best effort on Windows; usually needs LibreHardwareMonitor running as a WMI provider."""
+    try:
+        import wmi
+        zones = wmi.WMI(namespace="root\\WMI").MSAcpi_ThermalZoneTemperature()
+        return (zones[0].CurrentTemperature / 10.0) - 273.15 if zones else None
+    except Exception:
+        return None
+
+
+_default = Sensors()
+
+
+def read_all(keys=None) -> dict[str, Metric]:
+    """Shared, cached reader (see Sensors.read)."""
+    return _default.read(keys)
 
 
 class CpuHistory:
-    """Rolling CPU% history for the sparkline/graph widget."""
+    """Rolling CPU% history for the graph widget: one point per stats refresh (~1 min of history)."""
 
     def __init__(self, max_points: int = 60):
         self.max_points = max_points
@@ -235,7 +317,7 @@ class CpuHistory:
 
     def sample(self, cpu_percent: float | None) -> list[float]:
         now = time.monotonic()
-        if cpu_percent is not None and now - self._last_sample > 0.4:
+        if cpu_percent is not None and now - self._last_sample >= REFRESH_S * 0.95:
             self._values.append(cpu_percent)
             if len(self._values) > self.max_points:
                 self._values.pop(0)

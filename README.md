@@ -42,8 +42,8 @@ and isn't supported yet.
   last showed and the brightness.
 - **Scriptable**: `lovingcool-ctl` and a local JSON socket, for keybinds,
   bar widgets or cron jobs.
-- Brightness control. Light on resources: about 2% of one core and 60 MB
-  while running a 2 fps stats screen.
+- Brightness control. Light on resources: the service uses about 42 MB of
+  RAM and under 1% of one CPU core while running a live stats screen.
 
 ## Install
 

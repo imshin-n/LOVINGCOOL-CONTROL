@@ -164,3 +164,18 @@ def test_command_mid_stream_ends_and_resumes_stream(make_device):
         frame,                                   # and put the picture back
     ]
     ctl.stop()
+
+
+def test_scene_skips_unchanged_frames(make_device):
+    _, fake, ctl = controller(make_device)
+    player = ScenePlayer(ctl)
+    # Static text only: every frame after the first is identical.
+    from lovingcool_control.core.canvas import Widget
+    player.start(SceneConfig(widgets=[Widget(kind="text", text="static")], fps=30))
+    deadline = time.monotonic() + 2
+    while player.frames_skipped < 10 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    player.stop()
+    assert player.frames_sent == 1 and player.frames_skipped >= 10
+    jpegs = [w for w in fake.writes if w[:2] == b"\xff\xd8"]
+    assert len(jpegs) == 1

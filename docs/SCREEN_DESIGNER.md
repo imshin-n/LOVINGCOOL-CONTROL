@@ -59,10 +59,12 @@ not just added/removed:
 - **Custom Text** — static label
 - **Hardware Stat** — live-updating readout, sourced from `core/sensors.py`:
   CPU usage %, CPU temperature, CPU frequency, RAM usage %, disk usage %,
-  GPU usage % / temperature (NVIDIA via `nvidia-smi`, if present), battery
-  %, network sent/received (session totals), system uptime, clock, date.
+  GPU usage % / temperature (AMD on Linux via sysfs, NVIDIA via
+  `nvidia-smi`), battery %, network sent/received (session totals), system
+  uptime, clock, date. Stats refresh once a second, and a scene only reads
+  the stats it shows.
 - **CPU Graph** — a live sparkline/history graph of CPU usage over the last
-  ~25 seconds, gauge-style with a rounded border. This is the "cool
+  ~1 minute, gauge-style with a rounded border. This is the "cool
   feature" — most cheap AIO LCD tools only show a static number; this
   shows the trend.
 
@@ -76,9 +78,9 @@ best-effort fallback to a WMI query (`root\WMI` /
 `MSAcpi_ThermalZoneTemperature`, optional `wmi` package) — this only works
 on some systems (often needs LibreHardwareMonitor or similar running as a
 WMI provider); when it doesn't, the widget just shows "N/A" rather than
-erroring. GPU stats depend on `nvidia-smi` being on `PATH`, which the
-NVIDIA Windows driver installs by default for NVIDIA cards; no AMD/Intel
-GPU support currently.
+erroring. On Windows GPU stats need NVIDIA's `nvidia-smi` on `PATH` (the
+driver installs it); AMD GPU stats are Linux-only for now, and Intel GPUs
+aren't supported.
 
 **Scene files**: "Save As..." / "Open..." store the whole scene (background,
 fit mode, colours, orientation, rotation, fps and every widget) as JSON,

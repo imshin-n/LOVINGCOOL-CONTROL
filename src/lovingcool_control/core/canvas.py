@@ -168,7 +168,9 @@ def resize_to_canvas(img: Image.Image, width: int, height: int,
     return _cover_resize(img, width, height)
 
 
+@lru_cache(maxsize=64)
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    # Cached: building the default TrueType font is the most expensive part of drawing a widget.
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -234,6 +236,14 @@ def _draw_sparkline(draw: ImageDraw.ImageDraw, w: Widget, history: list[float]) 
     draw.text((x0 + 6, y0 + 4), label, fill=w.color, font=_load_font(max(10, w.font_size // 2)))
 
 
+def scene_metric_keys(cfg: SceneConfig) -> set[str]:
+    """The stats a scene actually shows, so only those get read."""
+    keys = {w.metric_key for w in cfg.widgets if w.kind == "stat"}
+    if any(w.kind == "cpu_graph" for w in cfg.widgets):
+        keys.add("cpu_percent")
+    return keys
+
+
 def compose_scene(
     cfg: SceneConfig,
     logical_width: int,
@@ -241,6 +251,7 @@ def compose_scene(
     bg_frame: Image.Image | None,
     cpu_history: sensors.CpuHistory,
     highlight_index: int | None = None,
+    metrics: dict[str, sensors.Metric] | None = None,
 ) -> Image.Image:
     """
     Compose one frame at the LOGICAL (already-oriented) canvas size —
@@ -256,7 +267,8 @@ def compose_scene(
     else:
         canvas = Image.new("RGB", (logical_width, logical_height), cfg.background.color)
 
-    metrics = sensors.read_all()
+    if metrics is None:
+        metrics = sensors.read_all(scene_metric_keys(cfg))
     _draw_widgets(canvas, cfg.widgets, metrics, cpu_history)
 
     if highlight_index is not None and 0 <= highlight_index < len(cfg.widgets):
@@ -280,6 +292,7 @@ def render_frame(
     cpu_history: sensors.CpuHistory,
     highlight_index: int | None = None,
     for_device: bool = False,
+    metrics: dict[str, sensors.Metric] | None = None,
 ) -> Image.Image:
     """
     width/height = the device's fixed native panel resolution.
@@ -290,7 +303,7 @@ def render_frame(
     ready to hand to LCDController.send_image().
     """
     logical_w, logical_h = logical_canvas_size(width, height, cfg.orientation)
-    composed = compose_scene(cfg, logical_w, logical_h, bg_frame, cpu_history, highlight_index)
+    composed = compose_scene(cfg, logical_w, logical_h, bg_frame, cpu_history, highlight_index, metrics)
     if for_device:
         return orient_for_device(composed, width, height, cfg.orientation, cfg.transparent_fill)
     return composed
@@ -315,6 +328,8 @@ class ScenePlayer:
         self._cpu_history = sensors.CpuHistory()
         self.last_frame: Image.Image | None = None
         self.last_error: str | None = None
+        self.frames_sent = 0
+        self.frames_skipped = 0
 
     @property
     def running(self) -> bool:
@@ -330,13 +345,23 @@ class ScenePlayer:
         def loop(stop: threading.Event) -> None:
             interval = 1.0 / max(1, cfg.fps)
             due = time.monotonic()
+            last_pixels: bytes | None = None
             while not stop.is_set():
                 bg = next(background)[0] if background is not None else None
                 try:
                     composed = compose_scene(cfg, logical_w, logical_h, bg, self._cpu_history)
-                    self.last_frame = composed   # the GUI preview shows this (same space as drag-editing)
-                    self.lcd.send_frame(orient_for_device(composed, native_w, native_h,
-                                                          cfg.orientation, cfg.transparent_fill))
+                    pixels = composed.tobytes()
+                    if pixels != last_pixels:
+                        # Most frames of a stats scene are identical (stats refresh once a
+                        # second); skipping them saves the rotate, JPEG encode and USB
+                        # transfer. Panels that blank stay lit through the keep-alive.
+                        self.last_frame = composed   # the GUI preview shows this
+                        self.lcd.send_frame(orient_for_device(composed, native_w, native_h,
+                                                              cfg.orientation, cfg.transparent_fill))
+                        last_pixels = pixels
+                        self.frames_sent += 1
+                    else:
+                        self.frames_skipped += 1
                 except Exception as e:
                     self.last_error = str(e)
                     log.error("Scene playback error: %s", e)

@@ -27,18 +27,16 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable, Iterator
+from importlib.util import find_spec
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageSequence
 
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    CV2_AVAILABLE = False
-
 from .device import AIODevice, DeviceError
+
+# OpenCV (and the numpy it pulls in) costs ~40 MB of RAM, and only video
+# needs it, so it's imported on first use rather than at startup.
+CV2_AVAILABLE = find_spec("cv2") is not None
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +49,9 @@ Frame = tuple[Image.Image, int]   # (image, duration_ms)
 #  Encoding
 # ──────────────────────────────────────────────────────────────
 
-def _rgb_array(img: Image.Image) -> np.ndarray:
+def _rgb_array(img: Image.Image):
+    import numpy as np  # only the (legacy) raw-pixel formats need it
+
     return np.asarray(img.convert("RGB"), dtype=np.uint16)
 
 
@@ -144,9 +144,13 @@ def load_gif_frames(path: str | Path) -> list[Frame]:
     return [(frame.copy(), frame.info.get("duration", 100)) for frame in ImageSequence.Iterator(gif)]
 
 
-def _require_cv2(purpose: str) -> None:
+def _require_cv2(purpose: str):
+    """Import OpenCV on first use (see CV2_AVAILABLE above)."""
     if not CV2_AVAILABLE:
         raise RuntimeError(f"{purpose} needs opencv-python-headless: pip install opencv-python-headless")
+    import cv2
+
+    return cv2
 
 
 def iter_video_frames(path: str | Path, max_side: int | None = None, loop: bool = False) -> Iterator[Frame]:
@@ -157,7 +161,7 @@ def iter_video_frames(path: str | Path, max_side: int | None = None, loop: bool 
     max_side, which keeps memory flat no matter how long or large the
     video is. With loop=True the file is reopened at the end, forever.
     """
-    _require_cv2("Video playback")
+    cv2 = _require_cv2("Video playback")
     while True:
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
