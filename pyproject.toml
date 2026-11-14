@@ -3,18 +3,22 @@ name = "lovingcool-control"
 dynamic = ["version"]
 description = "Open-source control for Lovingcool / Lovi.Cool AIO cooler LCD screens"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "PyQt6>=6.6.0",
     "hidapi>=0.14.0",
     "Pillow>=10.1.0",
     "numpy>=1.24",
-    "pyusb>=1.2.1",
     "pyserial>=3.5",
     "psutil>=5.9.0",
     "opencv-python-headless>=4.8.0",
     "wmi>=1.5.1; sys_platform == 'win32'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/imshin-n/LOVINGCOOL-CONTROL"
 
 [project.scripts]
 lovingcool-controld = "lovingcool_control.service.daemon:main"
@@ -26,6 +30,7 @@ lovingcool-control = "lovingcool_control.gui.app:main"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "pyusb>=1.2.1",   # tools/enumerate.py only
     "ruff>=0.6",
 ]
 build = [

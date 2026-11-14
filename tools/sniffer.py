@@ -178,7 +178,7 @@ def open_device(vid: int, pid: int, transport: str = "auto", baudrate: int = 115
         print(f"  - {e}")
     if any("ermission" in e or "ccess" in e for e in errors):
         print("\n  On Linux: sudo python tools/sniffer.py ...")
-        print("  Or install udev rules: sudo cp udev/99-lovicool.rules /etc/udev/rules.d/")
+        print("  Or install udev rules: sudo cp packaging/linux/70-lovingcool-control.rules /etc/udev/rules.d/")
         print("  Then: sudo udevadm control --reload && sudo udevadm trigger")
     sys.exit(1)
 

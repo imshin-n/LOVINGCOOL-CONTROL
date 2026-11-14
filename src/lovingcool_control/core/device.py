@@ -29,9 +29,9 @@ from importlib import resources
 from pathlib import Path
 
 try:
-    import hid
-except ImportError as e:
-    raise ImportError("Install hidapi: pip install hidapi") from e
+    import hid  # only needed for HID-transport devices; every known screen is serial
+except ImportError:
+    hid = None
 
 try:
     import serial
@@ -147,7 +147,7 @@ class AIODevice:
 
     def __init__(self, spec: DeviceSpec):
         self.spec = spec
-        self._dev: hid.device | serial.Serial | None = None
+        self._dev = None   # serial.Serial, or hid.device for HID transport
         self._connected = False
         self._on_disconnect: Callable[[], None] | None = None
         self._lock = threading.RLock()
@@ -163,6 +163,8 @@ class AIODevice:
                 self._connect_hid()
 
     def _connect_hid(self) -> None:
+        if hid is None:
+            raise DeviceError("This device uses USB HID; install hidapi (pip install hidapi / python-hidapi)")
         self._dev = hid.device()
         try:
             self._dev.open(self.spec.vid, self.spec.pid)
@@ -367,7 +369,7 @@ def find_serial_port(vid: int, pid: int) -> str | None:
 def find_devices(extra_specs: list[DeviceSpec] | None = None) -> list[AIODevice]:
     """Return an AIODevice for every connected USB HID or serial device matching a known spec."""
     specs = KNOWN_DEVICES + (extra_specs or [])
-    connected_hids = {(d["vendor_id"], d["product_id"]) for d in hid.enumerate()}
+    connected_hids = {(d["vendor_id"], d["product_id"]) for d in hid.enumerate()} if hid else set()
     connected_serial = {(p.vid, p.pid) for p in list_ports.comports() if p.vid is not None}
     found = []
     for spec in specs:
@@ -389,7 +391,7 @@ def find_any_cooler_candidates() -> list[dict]:
     candidates = []
     keywords = ["cooler", "aio", "pump", "lcd", "cool", "lovi", "rt-thread", "rtt"]
 
-    for d in hid.enumerate():
+    for d in (hid.enumerate() if hid else []):
         prod = (d.get("product_string") or "").lower()
         mfr = (d.get("manufacturer_string") or "").lower()
         score = sum(10 for kw in keywords if kw in prod or kw in mfr)

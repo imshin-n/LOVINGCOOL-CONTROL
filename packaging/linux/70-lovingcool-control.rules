@@ -1,0 +1,18 @@
+# lovingcool-control :: udev rules for Lovingcool / Lovi.Cool AIO cooler screens
+#
+# The LCD controllers are USB CDC-ACM serial ports (/dev/ttyACM*), VID 33c3.
+#  - TAG+="uaccess": the logged-in desktop user gets access automatically, no
+#    group membership (uucp/dialout) needed. Needs to sort before
+#    73-seat-late.rules, hence the "70-" prefix.
+#  - ID_MM_DEVICE_IGNORE: stops ModemManager from probing the port with AT
+#    commands, which can upset the controller and delay the app grabbing it.
+#  - /dev/lovingcool-<pid> symlink, for scripts.
+#
+# Install (the Arch package does this for you):
+#   sudo install -Dm644 packaging/linux/70-lovingcool-control.rules /etc/udev/rules.d/70-lovingcool-control.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   then unplug/replug the cooler.
+
+# 7788 = 7" txm818, 7791 = SC60 4", 7797 = sibling build (untested)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="33c3", ATTRS{idProduct}=="7788|7791|7797", \
+  ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess", SYMLINK+="lovingcool-$attr{idProduct}"

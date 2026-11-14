@@ -1,0 +1,65 @@
+# Maintainer: imshin-n <https://github.com/imshin-n>
+#
+# Builds the latest main branch of LOVINGCOOL-CONTROL:
+#   cd packaging/arch && makepkg -si
+pkgname=lovingcool-control-git
+_name=lovingcool-control
+pkgver=r0
+pkgrel=1
+pkgdesc="Show images, videos and live system stats on Lovingcool / Lovi.Cool AIO cooler screens"
+arch=('any')
+url="https://github.com/imshin-n/LOVINGCOOL-CONTROL"
+license=('MIT')
+depends=(
+  'python'
+  'python-numpy'
+  'python-opencv'
+  'python-pillow'
+  'python-psutil'
+  'python-pyqt6'
+  'python-pyserial'
+)
+optdepends=(
+  'python-hidapi: coolers whose screen controller is USB HID (none known yet)'
+  'python-pyusb: tools/enumerate.py device discovery helper'
+)
+makedepends=('git' 'python-build' 'python-installer' 'python-hatchling')
+checkdepends=('python-pytest')
+provides=("$_name")
+conflicts=("$_name")
+install=lovingcool-control.install
+source=("$_name::git+https://github.com/imshin-n/LOVINGCOOL-CONTROL.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$_name"
+  local ver
+  ver=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/lovingcool_control/__init__.py | tr -d '-' | sed 's/\.dev0$//')
+  printf '%s.r%s.%s' "$ver" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+  cd "$_name"
+  python -m build --wheel --no-isolation
+}
+
+check() {
+  cd "$_name"
+  # Hardware-free test suite; the GUI tests run on Qt's offscreen platform.
+  QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -m pytest -q -p no:cacheprovider tests
+}
+
+package() {
+  cd "$_name"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  # systemd user unit, pointed at the packaged command instead of ~/.local/bin
+  sed 's|^ExecStart=.*|ExecStart=/usr/bin/lovingcool-controld|' packaging/linux/lovingcool-control.service |
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/lovingcool-control.service"
+
+  install -Dm644 packaging/linux/70-lovingcool-control.rules "$pkgdir/usr/lib/udev/rules.d/70-lovingcool-control.rules"
+  install -Dm644 packaging/linux/lovingcool-control.desktop "$pkgdir/usr/share/applications/lovingcool-control.desktop"
+  install -Dm644 src/lovingcool_control/gui/icon.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/lovingcool-control.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

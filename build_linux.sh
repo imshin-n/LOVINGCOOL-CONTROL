@@ -7,7 +7,7 @@
 # Usage:
 #   ./build_linux.sh
 #
-# Output: dist/lovingcool-control (also copies udev/ rules alongside it for convenience)
+# Output: dist/lovingcool-control (also copies the udev rule alongside it for convenience)
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -32,10 +32,10 @@ uv run pyinstaller \
 
 echo "==> Bundling udev rules alongside the binary"
 mkdir -p dist/udev
-cp udev/99-lovicool.rules dist/udev/
+cp packaging/linux/70-lovingcool-control.rules dist/udev/
 
 echo
 echo "==> Done: dist/lovingcool-control"
 echo "    Linux users still need the udev rule for non-root USB access:"
-echo "      sudo cp dist/udev/99-lovicool.rules /etc/udev/rules.d/"
+echo "      sudo cp dist/udev/70-lovingcool-control.rules /etc/udev/rules.d/"
 echo "      sudo udevadm control --reload-rules && sudo udevadm trigger"

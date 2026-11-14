@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LOVINGCOOL-CONTROL
+GenericName=AIO Cooler Screen
+Comment=Show images, videos and live system stats on a Lovingcool AIO cooler's screen
+Exec=lovingcool-control
+Icon=lovingcool-control
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=cooler;aio;lcd;screen;lovingcool;lovi;
+StartupWMClass=lovingcool-control

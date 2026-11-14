@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 from PyQt6.QtCore import QSettings
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -189,6 +191,10 @@ def main():
     )
     app = QApplication(sys.argv)
     app.setApplicationName("lovingcool-control")
+    app.setDesktopFileName("lovingcool-control")   # Wayland: match the .desktop entry and its icon
+    icon = Path(__file__).with_name("icon.svg")
+    if icon.is_file():
+        app.setWindowIcon(QIcon(str(icon)))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

@@ -103,7 +103,6 @@ dependencies = [
     { name = "psutil" },
     { name = "pyqt6" },
     { name = "pyserial" },
-    { name = "pyusb" },
     { name = "wmi", marker = "sys_platform == 'win32'" },
 ]
 
@@ -113,6 +112,7 @@ build = [
 ]
 dev = [
     { name = "pytest" },
+    { name = "pyusb" },
     { name = "ruff" },
 ]
 
@@ -125,7 +125,6 @@ requires-dist = [
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "pyqt6", specifier = ">=6.6.0" },
     { name = "pyserial", specifier = ">=3.5" },
-    { name = "pyusb", specifier = ">=1.2.1" },
     { name = "wmi", marker = "sys_platform == 'win32'", specifier = ">=1.5.1" },
 ]
 
@@ -133,6 +132,7 @@ requires-dist = [
 build = [{ name = "pyinstaller", specifier = ">=6.3.0" }]
 dev = [
     { name = "pytest", specifier = ">=8" },
+    { name = "pyusb", specifier = ">=1.2.1" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 
