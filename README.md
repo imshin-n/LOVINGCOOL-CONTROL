@@ -9,11 +9,11 @@ Linux first (a background service that starts at login, keeps the screen
 lit and comes back after a replug or reboot); the GUI also runs on
 Windows and macOS.
 
-> **Origins:** this started from
+> **Origins:** this started as a fork of
 > [newan0805/loving_cool_aio_display_manage](https://github.com/newan0805/loving_cool_aio_display_manage)
-> ("lovi-ctrl"), whose author reverse-engineered the screen protocol
-> ([docs/PROTOCOL.md](docs/PROTOCOL.md)). It has since been largely
-> rewritten as a separate project.
+> ("lovi-ctrl"), whose author first worked out the screen protocol
+> ([docs/PROTOCOL.md](docs/PROTOCOL.md)). The code has since been rewritten
+> from scratch as a separate project.
 
 ## Supported coolers
 
@@ -233,14 +233,13 @@ src/lovingcool_control/
 ├── gui/        app.py, bridge.py (GUI -> service), theme.py, pages/ (device_view, info,
 │               settings, designer/), widgets/
 └── cli.py      lovingcool-ctl
-tools/          enumerate.py, sniffer.py, check_device.py, protocol_diff.py
+tools/          enumerate.py (find devices), sniffer.py (raw bytes / commands), check_device.py
 packaging/      linux/ (systemd unit, udev rule, desktop entry), arch/ (PKGBUILD), windows/
 docs/           PROTOCOL.md, SCREEN_DESIGNER.md, BUILDING.md
 ```
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Some modules still contain code from the
-original lovi-ctrl project, which was published without a license; those
-parts aren't covered by this license until they're rewritten or the
-original author agrees to it.
+MIT, see [LICENSE](LICENSE). Thanks to the author of the original
+[lovi-ctrl](https://github.com/newan0805/loving_cool_aio_display_manage) for
+working out the screen protocol this builds on.

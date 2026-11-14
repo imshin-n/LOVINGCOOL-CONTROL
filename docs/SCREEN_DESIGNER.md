@@ -1,95 +1,63 @@
 # Screen Designer
 
-A customizable live "dashboard" screen, separate from the simple LCD
-Display tab — layers a background with hardware-stat overlays and streams
-the composited result to the LCD continuously (1-30 fps).
+Build a live screen out of a background and widgets, then run it on the
+cooler.
 
-**Canvas size is automatic**: both this page and the LCD Display page use
-the panel size the connected device reports (through the service), or the
-last size seen while it's disconnected. A label under the preview says
-which.
+## Background
 
-**Background** — one of:
-- **Solid Color**
-- **Image** (PNG/JPG/BMP)
-- **GIF** — animated, frame timing from the GIF itself
-- **Video** (mp4/avi/mov/mkv/webm, via `opencv-python-headless`): decoded
-  lazily and downscaled to the panel as it plays, so any length or
-  resolution uses the same small amount of memory
+Choose **Colour**, **Image**, **GIF** or **Video**. For files, **Fit** sets
+how the picture meets the screen:
 
-**Fit mode** (image/GIF/video sources): **Cover** (crop to fill, default),
-**Contain** (letterbox, nothing cropped), **Stretch** (distort to fill
-exactly), or **Center** (no scaling at all).
+- **Fill (crop):** fills the screen, cropping what overflows.
+- **Fit (letterbox):** shows all of it, with bars in the fill colour.
+- **Stretch:** fills exactly, distorting if the shape differs.
+- **Original size:** no scaling, centred.
 
-**Transparent backgrounds**: if the source has an alpha channel, it's
-composited onto a **fill color** you pick (separate from the solid-background
-color) instead of showing black. The same fill color is used for corners
-introduced by rotation and by Contain/Center's letterboxing.
+Transparent areas (PNG, GIF) show the **fill colour**, which also fills the
+bars and the corners left by rotation. Videos are decoded as they play, so
+long or high-resolution files are fine.
 
-**Orientation — Landscape / Portrait**: a proper orientation swap, not just
-a rotated crop. The LCD panel's raster is a fixed physical shape (e.g.
-480x320) — Portrait mode composes your background and widgets on a
-*swapped-aspect* logical canvas (320x480) so the preview and drag-editing
-feel like designing a normal tall screen, then rotates that whole
-composition 90° back into the panel's native 480x320 buffer only at the
-moment a frame is sent. Switching orientation rescales existing widget
-positions proportionally so nothing ends up off-canvas. Implementation:
-`logical_canvas_size()` and `orient_for_device()` live in `core/lcd.py`
-(not `core/canvas.py`) precisely so both editing screens can share one
-implementation — `LCDController.send_image()` on the simple LCD Display
-tab uses them directly, and `core.canvas.compose_scene()` here uses them
-to render at the logical size (what `ScenePreview` shows and what drag
-hit-testing uses) before `orient_for_device()` does the final rotate/fit
-to the device's fixed native size. Verified live against real hardware in
-both orientations, on both editing screens (see below).
+## Layout
 
-**Fine rotation**: a separate continuous slider (0.0°-360.0°) applies *on
-top of* orientation, within the logical canvas, for small-angle mounting
-adjustments or effects — set it to exactly 180° to flip a Portrait layout
-if your panel ends up mounted upside-down relative to what you designed.
+**Orientation** switches between landscape and portrait. In portrait you
+design on a tall canvas and the finished frame is turned to fit the panel;
+widgets keep their relative positions when you switch. **Rotation** adds any
+further angle on top, for example 180° if the cooler is mounted upside down.
 
-**Widgets — click-drag directly in the preview to reposition them** (no more
-typing X/Y by hand, though the Add/Edit dialog still supports exact values
-if you want them). Click a widget to select it (a white outline appears in
-the preview and the matching row highlights in the list); drag to move;
-`Delete`/`Backspace` removes the selection. An optional **10px grid-snap**
-checkbox keeps things aligned. Each widget is independently positioned,
-colored, and sized, and can be **Edit**ed or **Duplicate**d after creation,
-not just added/removed:
-- **Custom Text** — static label
-- **Hardware Stat** — live-updating readout, sourced from `core/sensors.py`:
-  CPU usage %, CPU temperature, CPU frequency, RAM usage %, disk usage %,
-  GPU usage % / temperature (AMD on Linux via sysfs, NVIDIA via
-  `nvidia-smi`), battery %, network sent/received (session totals), system
-  uptime, clock, date. Stats refresh once a second, and a scene only reads
-  the stats it shows.
-- **CPU Graph** — a live sparkline/history graph of CPU usage over the last
-  ~1 minute, gauge-style with a rounded border. This is the "cool
-  feature" — most cheap AIO LCD tools only show a static number; this
-  shows the trend.
+## Widgets
 
-**Windows compatibility**: every metric in `core/sensors.py` is guarded so
-a missing capability degrades to "N/A" instead of crashing — this matters
-because `psutil`'s temperature/fan sensors (`sensors_temperatures()`,
-`sensors_fans()`) are **Linux/macOS-only**; they don't exist on Windows at
-all. CPU/RAM/disk/battery/network/uptime all work identically on Windows
-via `psutil`. For CPU temperature specifically on Windows, there's a
-best-effort fallback to a WMI query (`root\WMI` /
-`MSAcpi_ThermalZoneTemperature`, optional `wmi` package) — this only works
-on some systems (often needs LibreHardwareMonitor or similar running as a
-WMI provider); when it doesn't, the widget just shows "N/A" rather than
-erroring. On Windows GPU stats need NVIDIA's `nvidia-smi` on `PATH` (the
-driver installs it); AMD GPU stats are Linux-only for now, and Intel GPUs
-aren't supported.
+- **System stat:** time, date, CPU load / temperature / clock speed, memory,
+  disk space, GPU load / temperature (AMD on Linux, NVIDIA via `nvidia-smi`),
+  battery, network totals, uptime. Optionally prefixed with its name
+  ("CPU: 42%").
+- **Text:** any fixed text.
+- **CPU graph:** the last minute of CPU load as a line graph.
 
-**Scene files**: "Save As..." / "Open..." store the whole scene (background,
-fit mode, colours, orientation, rotation, fps and every widget) as JSON,
-by default in `~/.config/lovingcool-control/scenes/`. Run a saved scene
-without the GUI: `lovingcool-ctl scene <file.json>`. Your work in progress
-is also autosaved to `scenes/designer.json` and reopened next time.
+Add, edit (or double-click), duplicate and remove widgets from the list.
+On the canvas, click a widget to select it, drag to move it, and press
+Delete to remove it. **Snap** keeps drags on a 10 px grid. Each widget has
+its own position, size and colour.
 
-**Start Live** saves the scene to `scenes/designer-live.json` and asks the
-service to run it, so it keeps running after you close the window (with the
-background service installed). While live, every edit (dragging a widget,
-changing a colour, adding text) is pushed to the screen once it has been
-stable for about half a second. "Stop Live" turns the screen off.
+Stats refresh once a second, and only the stats the scene shows are read,
+so even busy scenes cost very little CPU. Unavailable stats show "N/A".
+
+## Running it
+
+**Start Live** sends the scene to the service, which keeps running it after
+you close the window (with the background service installed). Changes you
+make while live reach the screen within about half a second. **Stop Live**
+turns the screen off. The frame rate is adjustable; for a stats screen
+1–2 fps is plenty, since unchanged frames aren't re-sent anyway.
+
+## Scene files
+
+**Save Scene As…** / **Open Scene…** store scenes as JSON, by default in
+`~/.config/lovingcool-control/scenes/`. Saved scenes appear in the bottom
+bar's Scene list and the Devices tab's Scene mode, and can be run without
+the GUI:
+
+```bash
+lovingcool-ctl scene ~/.config/lovingcool-control/scenes/stats.json
+```
+
+Your work in progress is saved automatically and reopened next time.
