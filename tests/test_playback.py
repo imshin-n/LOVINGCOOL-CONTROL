@@ -179,3 +179,23 @@ def test_scene_skips_unchanged_frames(make_device):
     assert player.frames_sent == 1 and player.frames_skipped >= 10
     jpegs = [w for w in fake.writes if w[:2] == b"\xff\xd8"]
     assert len(jpegs) == 1
+
+
+def test_still_background_is_scaled_once(monkeypatch):
+    from PIL import Image
+
+    from lovingcool_control.core import canvas
+    from lovingcool_control.core.canvas import SceneConfig, compose_scene
+    from lovingcool_control.core.sensors import CpuHistory
+
+    calls = []
+    real = canvas.resize_to_canvas
+    monkeypatch.setattr(canvas, "resize_to_canvas", lambda *a: calls.append(1) or real(*a))
+    photo = Image.new("RGB", (1280, 1280), (10, 20, 30))
+    cfg = SceneConfig()
+    first = compose_scene(cfg, 480, 480, photo, CpuHistory(), metrics={})
+    second = compose_scene(cfg, 480, 480, photo, CpuHistory(), metrics={})
+    assert len(calls) == 1
+    assert first.tobytes() == second.tobytes() and first is not second
+    compose_scene(cfg, 480, 480, Image.new("RGB", (1280, 1280)), CpuHistory(), metrics={})   # new frame: rescaled
+    assert len(calls) == 2

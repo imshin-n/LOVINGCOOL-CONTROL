@@ -128,6 +128,24 @@ def _opaque(img: Image.Image, fill: RGB) -> Image.Image:
     return img.convert("RGB")
 
 
+_fitted: tuple[Image.Image, tuple, Image.Image] | None = None   # (source frame, settings, result)
+
+
+def fitted_background(img: Image.Image, width: int, height: int, mode: str, fill_color: RGB) -> Image.Image:
+    """
+    resize_to_canvas for a scene background, remembering the last result: a
+    still image is the same frame every tick, and scaling a large photo
+    down is most of the cost of drawing a frame. Returns a fresh copy to draw on.
+    """
+    global _fitted
+    key = (width, height, mode, fill_color)
+    cached = _fitted
+    if cached is None or cached[0] is not img or cached[1] != key:
+        cached = (img, key, resize_to_canvas(_opaque(img, fill_color), width, height, mode, fill_color))
+        _fitted = cached
+    return cached[2].copy()
+
+
 def resize_to_canvas(img: Image.Image, width: int, height: int, mode: str, fill_color: RGB) -> Image.Image:
     """
     Fit an image to width x height:
@@ -223,8 +241,7 @@ def compose_scene(
     if bg_frame is None:
         frame = Image.new("RGB", size, tuple(cfg.background.color))
     else:
-        frame = resize_to_canvas(_opaque(bg_frame, tuple(cfg.transparent_fill)), *size,
-                                 cfg.background.fit_mode, tuple(cfg.transparent_fill))
+        frame = fitted_background(bg_frame, *size, cfg.background.fit_mode, tuple(cfg.transparent_fill))
 
     if metrics is None:
         metrics = sensors.read_all(scene_metric_keys(cfg))

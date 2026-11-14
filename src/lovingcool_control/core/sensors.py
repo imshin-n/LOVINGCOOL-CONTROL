@@ -35,6 +35,11 @@ log = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
 REFRESH_S = 1.0
+# Ryzen's per-die sensor (Tccd1) swings 15 °C or more between consecutive reads as
+# cores wake and sleep, so the CPU temperature shown is the average of a few
+# seconds of readings rather than whichever spike one read happened to catch.
+TEMP_WINDOW_S = 3.0
+TEMP_SAMPLE_S = 0.05   # at most this often, however many widgets read it per frame
 
 try:
     import psutil
@@ -114,6 +119,7 @@ class Sensors:
         self._cache: dict[str, tuple[float, object]] = {}
         self._located = False
         self._cpu_temp_path: Path | None = None
+        self._cpu_temp_samples: deque[tuple[float, float]] = deque()
         self._amd_busy_path: Path | None = None
         self._amd_temp_path: Path | None = None
         self._nvidia_smi = shutil.which("nvidia-smi")
@@ -224,8 +230,6 @@ class Sensors:
                 return psutil.cpu_percent(interval=None) if PSUTIL_AVAILABLE else None
             if key == "ram_percent":
                 return psutil.virtual_memory().percent if PSUTIL_AVAILABLE else None
-            if key == "cpu_temp":
-                return self._cpu_temp()
             if key == "cpu_freq":
                 f = psutil.cpu_freq() if PSUTIL_AVAILABLE else None
                 return f.current / 1000.0 if f else None
@@ -266,12 +270,32 @@ class Sensors:
             self._pair("net_sent", "net_recv", net if PSUTIL_AVAILABLE else (lambda: (None, None)))
             return self._cache[key][1]
         now = time.monotonic()
+        if key == "cpu_temp":
+            self._sample_cpu_temp(now)
         cached = self._cache.get(key)
         if cached and now - cached[0] < self.refresh_s:
             return cached[1]
-        value = self._compute(key)
+        value = self._smoothed_cpu_temp() if key == "cpu_temp" else self._compute(key)
         self._cache[key] = (now, value)
         return value
+
+    def _sample_cpu_temp(self, now: float) -> None:
+        """Take a reading if the last is at least TEMP_SAMPLE_S old; keep TEMP_WINDOW_S of them."""
+        samples = self._cpu_temp_samples
+        if samples and now - samples[-1][0] < TEMP_SAMPLE_S:
+            return
+        try:
+            value = self._cpu_temp()
+        except Exception:
+            value = None
+        if value is not None:
+            samples.append((now, value))
+        while samples and now - samples[0][0] > TEMP_WINDOW_S:
+            samples.popleft()
+
+    def _smoothed_cpu_temp(self) -> float | None:
+        samples = self._cpu_temp_samples
+        return sum(v for _t, v in samples) / len(samples) if samples else None
 
     # ── Public ────────────────────────────────────────────────
 

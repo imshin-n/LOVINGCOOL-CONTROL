@@ -45,6 +45,22 @@ def test_cpu_temp_prefers_tccd1(sysfs):
     assert m["cpu_temp"].display == "47°C"
 
 
+def test_cpu_temp_is_averaged_so_spikes_dont_show(sysfs, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(sensors_mod.time, "monotonic", lambda: clock[0])
+    s = Sensors(sys_root=sysfs, refresh_s=1.0)
+    for i in range(30):                       # 3 s of reads at 10 a second, alternating 38 / 54 °C
+        write(sysfs / "class/hwmon/hwmon5/temp3_input", "38000\n" if i % 2 else "54000\n")
+        value = s.read({"cpu_temp"})["cpu_temp"].value
+        clock[0] += 0.1
+    assert value == pytest.approx(46.0, abs=0.6)
+    for _ in range(40):                       # a steady reading takes over within the window
+        write(sysfs / "class/hwmon/hwmon5/temp3_input", "40000\n")
+        value = s.read({"cpu_temp"})["cpu_temp"].value
+        clock[0] += 0.1
+    assert value == pytest.approx(40.0)
+
+
 def test_cpu_temp_falls_back_to_tctl_without_a_ccd_sensor(sysfs):
     for f in ("temp3_label", "temp3_input"):
         (sysfs / "class/hwmon/hwmon5" / f).unlink()
@@ -61,9 +77,9 @@ def test_only_requested_keys_are_read(sysfs, monkeypatch):
     computed = []
     real = s._compute
     monkeypatch.setattr(s, "_compute", lambda key: computed.append(key) or real(key))
-    out = s.read({"clock", "cpu_temp", "bogus"})
-    assert set(out) == {"clock", "cpu_temp"}
-    assert computed == ["cpu_temp"]
+    out = s.read({"clock", "ram_percent", "bogus"})
+    assert set(out) == {"clock", "ram_percent"}
+    assert computed == ["ram_percent"]
 
 
 def test_values_are_cached_for_the_refresh_interval(sysfs):
@@ -72,7 +88,7 @@ def test_values_are_cached_for_the_refresh_interval(sysfs):
     write(sysfs / "class/hwmon/hwmon5/temp3_input", "70000\n")
     assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(47.0)   # cached
     time.sleep(0.25)
-    assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(70.0)
+    assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx((47.0 + 70.0) / 2)   # averaged
 
 
 def test_clock_is_always_current(sysfs):
