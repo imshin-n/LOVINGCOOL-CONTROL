@@ -8,18 +8,14 @@ Shows timestamped messages with colour-coded severity.
 from __future__ import annotations
 
 from datetime import datetime
+from html import escape
 
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QTextEdit, QVBoxLayout, QWidget
 
-COLORS = {
-    "[OK]":    "#5BC97B",
-    "[ERROR]": "#E0556B",
-    "[WARN]":  "#E8A33D",
-    "[INFO]":  "#8B93A1",
-    "[TX]":    "#3DD6C8",
-    "[RX]":    "#9B77FF",
-}
+from lovingcool_control.gui.theme import DANGER, MUTED, SUCCESS, WARNING
+
+COLORS = {"[OK]": SUCCESS, "[ERROR]": DANGER, "[WARN]": WARNING}
 
 
 class LogConsole(QWidget):
@@ -30,11 +26,8 @@ class LogConsole(QWidget):
         layout.setSpacing(4)
 
         header = QHBoxLayout()
-        label = QLabel(title.upper())
-        label.setObjectName("sectionLabel")
+        label = QLabel(title)
         clear_btn = QPushButton("Clear")
-        clear_btn.setFixedHeight(22)
-        clear_btn.setStyleSheet("font-size: 11px; padding: 0 8px;")
         clear_btn.clicked.connect(self.clear)
         header.addWidget(label)
         header.addStretch()
@@ -42,23 +35,17 @@ class LogConsole(QWidget):
         layout.addLayout(header)
 
         self._text = QTextEdit()
-        self._text.setObjectName("logConsole")
         self._text.setReadOnly(True)
-        self._text.setMaximumHeight(130)
         layout.addWidget(self._text)
 
     def append(self, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
         # Detect severity tag
-        color = "#E8EBF0"
-        for tag, c in COLORS.items():
-            if tag in message:
-                color = c
-                break
-        html = (
-            f'<span style="color:#8B93A1">[{ts}]</span> '
-            f'<span style="color:{color}">{message}</span>'
-        )
+        color = next((c for tag, c in COLORS.items() if tag in message), None)
+        body = escape(message)
+        if color:
+            body = f'<span style="color:{color}">{body}</span>'
+        html = f'<span style="color:{MUTED}">[{ts}]</span> {body}'   # default text uses the palette
         self._text.append(html)
         self._text.moveCursor(QTextCursor.MoveOperation.End)
 

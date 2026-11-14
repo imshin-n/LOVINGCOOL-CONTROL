@@ -1,214 +1,71 @@
 """
 lovingcool-control :: gui/theme.py
-==========================
-Centralized visual identity for the app — a dark, "lab instrument"
-aesthetic fitting a hardware-control tool: deep graphite background,
-a cold cyan accent reminiscent of liquid cooling, monospace readouts
-for raw protocol data, and a warm amber for warnings/RGB previews.
+==================================
+Plain Qt look: the Fusion style with a light or dark palette, no custom
+stylesheet over the widgets. "auto" follows the desktop's colour scheme
+(Qt 6.5+), falling back to light.
 """
 
-# ── Palette ──────────────────────────────────────────────────
-BG_BASE      = "#14171C"   # near-black graphite
-BG_PANEL     = "#1B1F26"   # raised panel
-BG_PANEL_ALT = "#21262F"   # input fields / hover
-BORDER       = "#2C323D"
-TEXT_PRIMARY = "#E8EBF0"
-TEXT_MUTED   = "#8B93A1"
-ACCENT_CYAN  = "#3DD6C8"   # liquid-cool accent
-ACCENT_CYAN_DIM = "#2A7A72"
-ACCENT_AMBER = "#E8A33D"   # warnings / RGB indicator
-DANGER       = "#E0556B"
-SUCCESS      = "#5BC97B"
+from __future__ import annotations
 
-FONT_UI = "Inter, 'Segoe UI', -apple-system, sans-serif"
-FONT_MONO = "'JetBrains Mono', 'Cascadia Code', Consolas, monospace"
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtWidgets import QApplication
 
-STYLESHEET = f"""
-QMainWindow, QWidget {{
-    background-color: {BG_BASE};
-    color: {TEXT_PRIMARY};
-    font-family: {FONT_UI};
-    font-size: 13px;
-}}
+THEMES = ("auto", "light", "dark")
 
-QWidget#sidebar {{
-    background-color: {BG_PANEL};
-    border-right: 1px solid {BORDER};
-}}
+# Status colours, readable on both palettes
+SUCCESS = "#3BA55C"
+WARNING = "#D08A1E"
+DANGER = "#D6455D"
+MUTED = "#808890"
 
-QLabel#brandTitle {{
-    color: {ACCENT_CYAN};
-    font-size: 16px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    padding: 18px 16px 4px 16px;
-}}
 
-QLabel#brandSubtitle {{
-    color: {TEXT_MUTED};
-    font-size: 11px;
-    padding: 0px 16px 16px 16px;
-}}
+def _dark_palette() -> QPalette:
+    p = QPalette()
+    window, base, alt, text = QColor(53, 53, 53), QColor(35, 35, 35), QColor(45, 45, 45), QColor(220, 220, 220)
+    disabled = QColor(127, 127, 127)
+    highlight = QColor(42, 130, 218)
+    roles = {
+        QPalette.ColorRole.Window: window,
+        QPalette.ColorRole.WindowText: text,
+        QPalette.ColorRole.Base: base,
+        QPalette.ColorRole.AlternateBase: alt,
+        QPalette.ColorRole.ToolTipBase: window,
+        QPalette.ColorRole.ToolTipText: text,
+        QPalette.ColorRole.PlaceholderText: disabled,
+        QPalette.ColorRole.Text: text,
+        QPalette.ColorRole.Button: window,
+        QPalette.ColorRole.ButtonText: text,
+        QPalette.ColorRole.BrightText: QColor(255, 80, 80),
+        QPalette.ColorRole.Link: highlight,
+        QPalette.ColorRole.Highlight: highlight,
+        QPalette.ColorRole.HighlightedText: QColor(255, 255, 255),
+        QPalette.ColorRole.Light: QColor(70, 70, 70),
+        QPalette.ColorRole.Midlight: QColor(60, 60, 60),
+        QPalette.ColorRole.Mid: QColor(40, 40, 40),
+        QPalette.ColorRole.Dark: QColor(25, 25, 25),
+        QPalette.ColorRole.Shadow: QColor(15, 15, 15),
+    }
+    for role, color in roles.items():
+        p.setColor(role, color)
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText,
+                 QPalette.ColorRole.HighlightedText):
+        p.setColor(QPalette.ColorGroup.Disabled, role, disabled)
+    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor(80, 80, 80))
+    return p
 
-QPushButton#navButton {{
-    background-color: transparent;
-    color: {TEXT_MUTED};
-    border: none;
-    border-left: 3px solid transparent;
-    text-align: left;
-    padding: 12px 16px;
-    font-size: 13px;
-    font-weight: 500;
-}}
 
-QPushButton#navButton:hover {{
-    background-color: {BG_PANEL_ALT};
-    color: {TEXT_PRIMARY};
-}}
+def system_prefers_dark(app: QApplication) -> bool:
+    hints = app.styleHints()
+    scheme = getattr(hints, "colorScheme", None)
+    return bool(scheme and scheme() == Qt.ColorScheme.Dark)
 
-QPushButton#navButton:checked {{
-    background-color: {BG_PANEL_ALT};
-    color: {ACCENT_CYAN};
-    border-left: 3px solid {ACCENT_CYAN};
-}}
 
-QWidget#statusBar {{
-    background-color: {BG_PANEL};
-    border-top: 1px solid {BORDER};
-}}
-
-QLabel#statusDot {{
-    font-size: 14px;
-}}
-
-QLabel#statusText {{
-    color: {TEXT_MUTED};
-    font-size: 11px;
-}}
-
-QFrame#panel {{
-    background-color: {BG_PANEL};
-    border: 1px solid {BORDER};
-    border-radius: 8px;
-}}
-
-QLabel#pageTitle {{
-    font-size: 20px;
-    font-weight: 700;
-    color: {TEXT_PRIMARY};
-}}
-
-QLabel#pageSubtitle {{
-    color: {TEXT_MUTED};
-    font-size: 12px;
-}}
-
-QLabel#sectionLabel {{
-    color: {TEXT_MUTED};
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-}}
-
-QPushButton {{
-    background-color: {BG_PANEL_ALT};
-    color: {TEXT_PRIMARY};
-    border: 1px solid {BORDER};
-    border-radius: 6px;
-    padding: 8px 16px;
-    font-size: 12px;
-    font-weight: 600;
-}}
-
-QPushButton:hover {{
-    border-color: {ACCENT_CYAN_DIM};
-}}
-
-QPushButton:pressed {{
-    background-color: {BORDER};
-}}
-
-QPushButton#primaryButton {{
-    background-color: {ACCENT_CYAN};
-    color: {BG_BASE};
-    border: none;
-}}
-
-QPushButton#primaryButton:hover {{
-    background-color: #4FE3D5;
-}}
-
-QPushButton#dangerButton {{
-    background-color: transparent;
-    color: {DANGER};
-    border: 1px solid {DANGER};
-}}
-
-QSlider::groove:horizontal {{
-    height: 4px;
-    background: {BORDER};
-    border-radius: 2px;
-}}
-
-QSlider::handle:horizontal {{
-    background: {ACCENT_CYAN};
-    width: 16px;
-    height: 16px;
-    margin: -6px 0;
-    border-radius: 8px;
-}}
-
-QSlider::sub-page:horizontal {{
-    background: {ACCENT_CYAN_DIM};
-    border-radius: 2px;
-}}
-
-QComboBox, QLineEdit, QSpinBox {{
-    background-color: {BG_PANEL_ALT};
-    border: 1px solid {BORDER};
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: {TEXT_PRIMARY};
-}}
-
-QComboBox:hover, QLineEdit:hover {{
-    border-color: {ACCENT_CYAN_DIM};
-}}
-
-QTextEdit#logConsole {{
-    background-color: #0E1014;
-    color: {SUCCESS};
-    font-family: {FONT_MONO};
-    font-size: 11px;
-    border: 1px solid {BORDER};
-    border-radius: 6px;
-}}
-
-QProgressBar {{
-    background-color: {BG_PANEL_ALT};
-    border: none;
-    border-radius: 4px;
-    height: 8px;
-}}
-
-QProgressBar::chunk {{
-    background-color: {ACCENT_CYAN};
-    border-radius: 4px;
-}}
-
-QScrollBar:vertical {{
-    background: {BG_BASE};
-    width: 10px;
-}}
-
-QScrollBar::handle:vertical {{
-    background: {BORDER};
-    border-radius: 5px;
-    min-height: 30px;
-}}
-
-QScrollBar::handle:vertical:hover {{
-    background: {ACCENT_CYAN_DIM};
-}}
-"""
+def apply_theme(app: QApplication, theme: str = "auto") -> str:
+    """Apply Fusion + palette; returns the resolved theme ("light" or "dark")."""
+    app.setStyle("Fusion")
+    dark = theme == "dark" or (theme == "auto" and system_prefers_dark(app))
+    app.setPalette(_dark_palette() if dark else app.style().standardPalette())
+    app.setStyleSheet("")
+    return "dark" if dark else "light"

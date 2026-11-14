@@ -114,24 +114,17 @@ class ScreenDesignerPage(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(32, 24, 32, 24)
-        layout.setSpacing(20)
-
-        title = QLabel("Screen Designer")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel("Build a custom live screen: backgrounds, hardware stats, rotation, and more")
-        subtitle.setObjectName("pageSubtitle")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
 
         content = QHBoxLayout()
-        content.setSpacing(24)
+        content.setSpacing(12)
 
         # Left: preview
         preview_panel = QFrame()
         preview_panel.setObjectName("panel")
         preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(24, 24, 24, 24)
+        preview_layout.setContentsMargins(12, 12, 12, 12)
         preview_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview = ScenePreview()
         self.preview.widget_moved.connect(self._on_widget_dragged)
@@ -168,10 +161,10 @@ class ScreenDesignerPage(QWidget):
         controls_panel = QFrame()
         controls_panel.setObjectName("panel")
         controls_layout = QVBoxLayout(controls_panel)
-        controls_layout.setContentsMargins(24, 24, 24, 24)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
         controls_layout.setSpacing(14)
 
-        bg_label = QLabel("BACKGROUND")
+        bg_label = QLabel("Background")
         bg_label.setObjectName("sectionLabel")
         controls_layout.addWidget(bg_label)
 
@@ -210,7 +203,7 @@ class ScreenDesignerPage(QWidget):
         controls_layout.addLayout(color_row)
         self._update_color_buttons()
 
-        orient_label = QLabel("ORIENTATION")
+        orient_label = QLabel("Orientation")
         orient_label.setObjectName("sectionLabel")
         controls_layout.addWidget(orient_label)
         orient_row = QHBoxLayout()
@@ -231,7 +224,7 @@ class ScreenDesignerPage(QWidget):
         orient_hint.setWordWrap(True)
         controls_layout.addWidget(orient_hint)
 
-        rot_label = QLabel("FINE ROTATION (on top of orientation — try 180° to flip)")
+        rot_label = QLabel("Fine rotation (on top of orientation; 180° flips it)")
         rot_label.setObjectName("sectionLabel")
         controls_layout.addWidget(rot_label)
         rot_row = QHBoxLayout()
@@ -247,7 +240,7 @@ class ScreenDesignerPage(QWidget):
         rot_row.addWidget(self.rotation_spin)
         controls_layout.addLayout(rot_row)
 
-        widgets_label = QLabel("WIDGETS (hardware stats, text, CPU graph)")
+        widgets_label = QLabel("Widgets (hardware stats, text, CPU graph)")
         widgets_label.setObjectName("sectionLabel")
         controls_layout.addWidget(widgets_label)
         self.widgets_list = QListWidget()
@@ -270,7 +263,7 @@ class ScreenDesignerPage(QWidget):
         self.snap_check.toggled.connect(lambda on: setattr(self.preview, "snap", 10 if on else 0))
         controls_layout.addWidget(self.snap_check)
 
-        preset_label = QLabel("SCENE FILE")
+        preset_label = QLabel("Scene file")
         preset_label.setObjectName("sectionLabel")
         controls_layout.addWidget(preset_label)
         preset_row = QHBoxLayout()
@@ -288,6 +281,23 @@ class ScreenDesignerPage(QWidget):
 
         self._style_orientation_buttons()
         self._on_bg_type_changed()
+        self._plain_look()
+
+    def _plain_look(self) -> None:
+        """Native-looking widgets: framed panels, bold section headings, small hints."""
+        for frame in self.findChildren(QFrame):
+            if frame.objectName() == "panel":
+                frame.setFrameShape(QFrame.Shape.StyledPanel)
+        for label in self.findChildren(QLabel):
+            name = label.objectName()
+            if name == "sectionLabel":
+                font = label.font()
+                font.setBold(True)
+                label.setFont(font)
+            elif name == "pageSubtitle":
+                font = label.font()
+                font.setPointSizeF(font.pointSizeF() * 0.9)
+                label.setFont(font)
 
     # ── State helpers ────────────────────────────────────────
 

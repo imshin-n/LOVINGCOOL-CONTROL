@@ -94,15 +94,20 @@ hardware.
 
 ### The app
 
-Open **LOVINGCOOL-CONTROL** from your launcher (or run `lovingcool-control`):
+Open **LOVINGCOOL-CONTROL** from your launcher (or run `lovingcool-control`).
+It uses plain Qt widgets in a light or dark theme (Settings → Theme, or
+follow the system), laid out like a desktop RGB-controller app:
 
-- **Status**: connection, model and firmware, what's showing, brightness,
-  turn the screen off, and other USB devices that might be an unrecognised
-  cooler.
-- **LCD Display**: pick an image, GIF or video, or type text, then **Send
-  to LCD**. Remembers your last choices.
+- **Devices**: your cooler as a tab on the left. A preview of the screen,
+  a **Mode** list (Image / GIF / Video, Text, Scene, Off) with that mode's
+  options, orientation, rotation, brightness, and **Apply**.
 - **Screen Designer**: build a dashboard and press **Start Live**. Edits
   you make while live appear on the screen within about half a second.
+- **Information**: device details, the service, other USB devices that
+  might be an unrecognised cooler, and the event log.
+- **Settings**: theme, and where your settings and scenes live.
+- The bottom bar has your saved scenes (**Show Scene**, **Save Scene** from
+  the designer), **Screen Off** and **Rescan Devices**.
 
 The app is a client of the background service, so whatever you show keeps
 running after you close it.
@@ -215,7 +220,7 @@ systemctl --user start lovingcool-control
 
 ```bash
 uv sync                  # environment with dev tools
-uv run pytest            # ~80 tests, no hardware needed (GUI tests run headless)
+uv run pytest            # ~85 tests, no hardware needed (GUI tests run headless)
 uv run ruff check src tests tools
 uv run lovingcool-control
 ```
@@ -225,7 +230,8 @@ src/lovingcool_control/
 ├── core/       protocol.py (frame codec), device.py (connection, devices.toml),
 │               lcd.py (encoding, playback, keep-alive), canvas.py (scenes), sensors.py
 ├── service/    daemon.py (lovingcool-controld), server.py (socket), state.py
-├── gui/        app.py, bridge.py (GUI -> service), pages/ (status, lcd, designer/)
+├── gui/        app.py, bridge.py (GUI -> service), theme.py, pages/ (device_view, info,
+│               settings, designer/), widgets/
 └── cli.py      lovingcool-ctl
 tools/          enumerate.py, sniffer.py, check_device.py, protocol_diff.py
 packaging/      linux/ (systemd unit, udev rule, desktop entry), arch/ (PKGBUILD), windows/

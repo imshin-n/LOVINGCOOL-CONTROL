@@ -114,21 +114,23 @@ def test_panel_size_remembered_when_disconnected(env):
         bridge.shutdown()
 
 
-def test_main_window_lcd_page_sends_text(env):
+def test_device_view_sends_text_and_off(env):
     from lovingcool_control.gui.app import MainWindow
 
     bridge = ServiceBridge(socket_path=env["sock"], runner_factory=env["factory"], poll_ms=100)
     w = MainWindow(bridge)
     try:
         assert wait_until(lambda: bridge.connected)
-        assert "SC60" in w.status_label.text()
-        page = w.lcd_page
-        page._switch_source("text")
-        page.text_field.setText("Hi there")
-        page.font_size_spin.setValue(72)
-        page._send_to_device()
+        assert wait_until(lambda: "SC60" in w.status_label.text())
+        assert w.devices_tab.tabs.tabText(0) == "SC60"          # one side tab per device
+        view = w.device_view
+        view.mode.setCurrentIndex(view.mode.findData("text"))
+        view.text.setText("Hi there")
+        view.font_size.setValue(72)
+        view.apply()
         assert wait_until(lambda: bridge.status.get("content") == 'text "Hi there"')
-        page._stop_display()
+        view.mode.setCurrentIndex(view.mode.findData("off"))
+        view.apply()
         assert wait_until(lambda: bridge.status.get("content") == "off")
     finally:
         w.close()
@@ -142,7 +144,7 @@ def test_designer_live_mode_runs_and_follows_edits(env):
     w = MainWindow(bridge)
     try:
         assert wait_until(lambda: bridge.connected)
-        d = w.screen_page
+        d = w.designer
         d._widgets.append(Widget(kind="text", text="one", x=10, y=10))
         d._sync_widgets_list()
         d.play_btn.setChecked(True)
@@ -165,17 +167,68 @@ def test_designer_reopens_autosaved_work(env):
 
     bridge = ServiceBridge(socket_path=env["sock"], runner_factory=env["factory"], poll_ms=100)
     w = MainWindow(bridge)
-    w.screen_page._widgets.append(Widget(kind="text", text="keep me"))
-    w.screen_page._set_orientation("portrait")
-    assert wait_until(lambda: [x["text"] for x in (w.screen_page._last_autosaved or {}).get("widgets", [])]
+    w.designer._widgets.append(Widget(kind="text", text="keep me"))
+    w.designer._set_orientation("portrait")
+    assert wait_until(lambda: [x["text"] for x in (w.designer._last_autosaved or {}).get("widgets", [])]
                       == ["keep me"])
     w.close()
 
     bridge2 = ServiceBridge(socket_path=env["sock"], runner_factory=env["factory"], poll_ms=100)
     w2 = MainWindow(bridge2)
     try:
-        assert [x.text for x in w2.screen_page._widgets] == ["keep me"]
-        assert w2.screen_page._orientation == "portrait"
-        assert w2.screen_page.btn_portrait.isChecked()
+        assert [x.text for x in w2.designer._widgets] == ["keep me"]
+        assert w2.designer._orientation == "portrait"
+        assert w2.designer.btn_portrait.isChecked()
     finally:
         w2.close()
+
+
+def test_scene_mode_and_bottom_bar_use_saved_scenes(env):
+    from lovingcool_control.core.canvas import SceneConfig, save_scene
+    from lovingcool_control.gui.app import MainWindow
+    from lovingcool_control.gui.pages.device_view import scenes_dir
+
+    scenes_dir().mkdir(parents=True)
+    save_scene(SceneConfig(widgets=[Widget(kind="text", text="saved")]), scenes_dir() / "mine.json")
+    save_scene(SceneConfig(), scenes_dir() / "designer.json")            # working file: not listed
+
+    bridge = ServiceBridge(socket_path=env["sock"], runner_factory=env["factory"], poll_ms=100)
+    w = MainWindow(bridge)
+    try:
+        assert wait_until(lambda: bridge.connected)
+        assert [w.scene_combo.itemText(i) for i in range(w.scene_combo.count())] == ["mine"]
+        view = w.device_view
+        assert [view.scene.itemText(i) for i in range(view.scene.count())] == ["mine"]
+        view.mode.setCurrentIndex(view.mode.findData("scene"))
+        assert view.preview.pixmap() is not None and not view.preview.pixmap().isNull()
+        w._show_scene()
+        assert wait_until(lambda: bridge.status.get("kind") == "scene"
+                          and bridge.status.get("path", "").endswith("mine.json"))
+    finally:
+        w.close()
+
+
+def test_no_device_shows_placeholder_tab(env, monkeypatch):
+    from lovingcool_control.gui.app import MainWindow
+
+    def empty_factory(socket_path):
+        r = ServiceRunner(socket_path, env["tmp"] / "state.json", poll=0.05, discover=lambda: [])
+        env["runners"].append(r)
+        return r
+
+    bridge = ServiceBridge(socket_path=env["sock"], runner_factory=empty_factory, poll_ms=100)
+    w = MainWindow(bridge)
+    try:
+        assert wait_until(lambda: "Waiting" in w.status_label.text())
+        assert w.devices_tab.tabs.tabText(0) == "No device"
+    finally:
+        w.close()
+
+
+def test_theme_switch(qapp):
+    from lovingcool_control.gui.theme import apply_theme
+
+    assert apply_theme(qapp, "dark") == "dark"
+    assert qapp.palette().window().color().lightness() < 100
+    assert apply_theme(qapp, "light") == "light"
+    assert qapp.palette().window().color().lightness() > 150
