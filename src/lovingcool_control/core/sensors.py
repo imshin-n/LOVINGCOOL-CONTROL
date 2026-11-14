@@ -43,9 +43,11 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 # CPU temperature drivers, best first, with the sensor label to prefer in each.
-_CPU_HWMON = [("k10temp", ("tctl", "tdie")), ("zenpower", ("tdie", "tctl")),
+# On Ryzen, Tccd1 is the first core die's real temperature; Tctl is a control
+# value that some models offset upwards, so it is only the fallback.
+_CPU_HWMON = [("k10temp", ("tccd1", "tdie", "tctl")), ("zenpower", ("tccd1", "tdie", "tctl")),
               ("coretemp", ("package id 0",)), ("cpu_thermal", ()), ("acpitz", ())]
-_CPU_TEMP_HINTS = ("tctl", "tdie", "package id 0", "cpu package", "core 0", "cpu")   # psutil fallback, best first
+_CPU_TEMP_HINTS = ("tccd1", "tdie", "tctl", "package id 0", "cpu package", "core 0", "cpu")   # psutil fallback, best first
 
 
 @dataclass

@@ -39,10 +39,16 @@ def sysfs(tmp_path):
     return tmp_path
 
 
-def test_cpu_temp_prefers_tctl(sysfs):
+def test_cpu_temp_prefers_tccd1(sysfs):
     m = Sensors(sys_root=sysfs).read({"cpu_temp"})
-    assert m["cpu_temp"].available and m["cpu_temp"].value == pytest.approx(52.125)
-    assert m["cpu_temp"].display == "52°C"
+    assert m["cpu_temp"].available and m["cpu_temp"].value == pytest.approx(47.0)
+    assert m["cpu_temp"].display == "47°C"
+
+
+def test_cpu_temp_falls_back_to_tctl_without_a_ccd_sensor(sysfs):
+    for f in ("temp3_label", "temp3_input"):
+        (sysfs / "class/hwmon/hwmon5" / f).unlink()
+    assert Sensors(sys_root=sysfs).read({"cpu_temp"})["cpu_temp"].value == pytest.approx(52.125)
 
 
 def test_amd_gpu_picks_discrete_card(sysfs):
@@ -62,9 +68,9 @@ def test_only_requested_keys_are_read(sysfs, monkeypatch):
 
 def test_values_are_cached_for_the_refresh_interval(sysfs):
     s = Sensors(sys_root=sysfs, refresh_s=0.2)
-    assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(52.125)
-    write(sysfs / "class/hwmon/hwmon5/temp1_input", "70000\n")
-    assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(52.125)   # cached
+    assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(47.0)
+    write(sysfs / "class/hwmon/hwmon5/temp3_input", "70000\n")
+    assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(47.0)   # cached
     time.sleep(0.25)
     assert s.read({"cpu_temp"})["cpu_temp"].value == pytest.approx(70.0)
 
