@@ -16,7 +16,7 @@ class ScreenPreview(QLabel):
         self.setFrameShadow(QFrame.Shadow.Sunken)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setAutoFillBackground(True)
-        self.setStyleSheet("background-color: #000; color: #888;")   # the panel itself is black when off
+        self.setStyleSheet("background-color: #000; color: #9C8A82;")   # the panel itself is black when off
         self.setText("No preview")
 
     def set_image(self, img) -> None:

@@ -27,8 +27,8 @@ class ScenePreview(QLabel):
         self._max_h = max_height
         self.setFixedSize(max_width, max_height)
         self.setStyleSheet(
-            "background-color: #0E1014; border: 2px solid #2C323D; "
-            "border-radius: 12px; color: #8B93A1; font-size: 12px;"
+            "background-color: #140c0c; border: 2px solid #3a2d2b; "
+            "border-radius: 12px; color: #9C8A82; font-size: 12px;"
         )
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setText("No preview")

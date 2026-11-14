@@ -1,9 +1,10 @@
 """
 lovingcool-control :: gui/theme.py
 ==================================
-Plain Qt look: the Fusion style with a light or dark palette, no custom
-stylesheet over the widgets. "auto" follows the desktop's colour scheme
-(Qt 6.5+), falling back to light.
+Plain Qt look: the Fusion style with a light or dark palette and a single
+stylesheet rule for tab panels. "auto" follows the desktop's colour scheme
+(Qt 6.5+), falling back to light. Both palettes are warm (brown-black /
+cream with a copper accent).
 """
 
 from __future__ import annotations
@@ -15,45 +16,55 @@ from PyQt6.QtWidgets import QApplication
 THEMES = ("auto", "light", "dark")
 
 # Status colours, readable on both palettes
-SUCCESS = "#3BA55C"
-WARNING = "#D08A1E"
-DANGER = "#D6455D"
-MUTED = "#808890"
+SUCCESS = "#6DBE6A"
+WARNING = "#E0A040"
+DANGER = "#E0604F"
+MUTED = "#9C8A82"
+
+# Warm palette. Dark: #1b1111 for the window frame, bars and fields, #231a1a
+# for tab panels, with a copper accent. Light: the same hues as cream and
+# warm greys.
+ACCENT = "#C8743E"
+
+DARK = {
+    "window": "#1b1111", "base": "#1b1111", "alt": "#261b1b", "button": "#2e2322", "pane": "#231a1a",
+    "border": "#3a2d2b",
+    "text": "#EADBD2", "disabled": "#7d6c66", "placeholder": "#8a7770",
+    "light": "#4a3a37", "midlight": "#3a2d2b", "mid": "#1f1616", "dark": "#140c0c", "shadow": "#0b0606",
+    "highlight": ACCENT, "highlighted_text": "#ffffff", "link": "#E39A63",
+}
+LIGHT = {
+    "window": "#EFE4DC", "base": "#FCF8F4", "alt": "#F1E6DE", "button": "#EBDFD6", "pane": "#F8F1EB",
+    "border": "#CDBAAE",
+    "text": "#2B1E1B", "disabled": "#A8968E", "placeholder": "#9A877F",
+    "light": "#FFFFFF", "midlight": "#F6EEE8", "mid": "#C9B6AA", "dark": "#A8938A", "shadow": "#6E5C55",
+    "highlight": ACCENT, "highlighted_text": "#ffffff", "link": "#A9562A",
+}
 
 
-def _dark_palette() -> QPalette:
+def _palette(c: dict[str, str]) -> QPalette:
+    R = QPalette.ColorRole
     p = QPalette()
-    window, base, alt, text = QColor(53, 53, 53), QColor(35, 35, 35), QColor(45, 45, 45), QColor(220, 220, 220)
-    disabled = QColor(127, 127, 127)
-    highlight = QColor(42, 130, 218)
     roles = {
-        QPalette.ColorRole.Window: window,
-        QPalette.ColorRole.WindowText: text,
-        QPalette.ColorRole.Base: base,
-        QPalette.ColorRole.AlternateBase: alt,
-        QPalette.ColorRole.ToolTipBase: window,
-        QPalette.ColorRole.ToolTipText: text,
-        QPalette.ColorRole.PlaceholderText: disabled,
-        QPalette.ColorRole.Text: text,
-        QPalette.ColorRole.Button: window,
-        QPalette.ColorRole.ButtonText: text,
-        QPalette.ColorRole.BrightText: QColor(255, 80, 80),
-        QPalette.ColorRole.Link: highlight,
-        QPalette.ColorRole.Highlight: highlight,
-        QPalette.ColorRole.HighlightedText: QColor(255, 255, 255),
-        QPalette.ColorRole.Light: QColor(70, 70, 70),
-        QPalette.ColorRole.Midlight: QColor(60, 60, 60),
-        QPalette.ColorRole.Mid: QColor(40, 40, 40),
-        QPalette.ColorRole.Dark: QColor(25, 25, 25),
-        QPalette.ColorRole.Shadow: QColor(15, 15, 15),
+        R.Window: "window", R.WindowText: "text", R.Base: "base", R.AlternateBase: "alt",
+        R.ToolTipBase: "button", R.ToolTipText: "text", R.PlaceholderText: "placeholder",
+        R.Text: "text", R.Button: "button", R.ButtonText: "text", R.BrightText: "highlighted_text",
+        R.Link: "link", R.Highlight: "highlight", R.HighlightedText: "highlighted_text",
+        R.Light: "light", R.Midlight: "midlight", R.Mid: "mid", R.Dark: "dark", R.Shadow: "shadow",
     }
-    for role, color in roles.items():
-        p.setColor(role, color)
-    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText,
-                 QPalette.ColorRole.HighlightedText):
-        p.setColor(QPalette.ColorGroup.Disabled, role, disabled)
-    p.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Highlight, QColor(80, 80, 80))
+    for role, key in roles.items():
+        p.setColor(role, QColor(c[key]))
+    for role in (R.Text, R.ButtonText, R.WindowText, R.HighlightedText):
+        p.setColor(QPalette.ColorGroup.Disabled, role, QColor(c["disabled"]))
+    p.setColor(QPalette.ColorGroup.Disabled, R.Highlight, QColor(c["mid"]))
     return p
+
+
+def _panel_css(c: dict[str, str]) -> str:
+    # Fusion fills tab panes with a lightened window colour; pin them to the
+    # palette's panel colour so the reference shades stay exact.
+    return (f"QTabWidget::pane {{ background: {c['pane']}; border: 1px solid {c['border']}; }}"
+            f"QTabWidget QTabWidget::pane {{ background: {c['pane']}; }}")
 
 
 def system_prefers_dark(app: QApplication) -> bool:
@@ -66,6 +77,7 @@ def apply_theme(app: QApplication, theme: str = "auto") -> str:
     """Apply Fusion + palette; returns the resolved theme ("light" or "dark")."""
     app.setStyle("Fusion")
     dark = theme == "dark" or (theme == "auto" and system_prefers_dark(app))
-    app.setPalette(_dark_palette() if dark else app.style().standardPalette())
-    app.setStyleSheet("")
+    colors = DARK if dark else LIGHT
+    app.setPalette(_palette(colors))
+    app.setStyleSheet(_panel_css(colors))
     return "dark" if dark else "light"
