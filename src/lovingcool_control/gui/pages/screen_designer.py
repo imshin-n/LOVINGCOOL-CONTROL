@@ -49,7 +49,7 @@ from lovingcool_control.core.canvas import (
     SceneConfig,
     ScenePlayer,
     Widget,
-    load_background_frames,
+    background_preview_frame,
     render_frame,
     widget_bbox,
 )
@@ -699,7 +699,7 @@ class ScreenDesignerPage(QWidget):
         """The LCD panel's fixed physical raster (unaffected by orientation)."""
         device = self._get_device()
         if device and device.connected:
-            return device.spec.lcd_width, device.spec.lcd_height
+            return device.panel_size
         return DEFAULT_CANVAS
 
     def _canvas_size(self) -> tuple[int, int]:
@@ -746,8 +746,7 @@ class ScreenDesignerPage(QWidget):
         self._update_canvas_size_label(self._canvas_size())
         native_width, native_height = self._device_native_size()
         try:
-            frames = load_background_frames(cfg.background)
-            bg = frames[0][0] if frames else None
+            bg = background_preview_frame(cfg.background)
             # for_device=False -> logical/oriented frame, matching what drag-editing expects
             frame = render_frame(cfg, native_width, native_height, bg, self._preview_history,
                                   highlight_index=self.preview.selected_index, for_device=False)
@@ -756,6 +755,15 @@ class ScreenDesignerPage(QWidget):
             self.log_message.emit(f"[ERROR] Preview failed: {e}")
 
     def _tick_preview(self):
+        if self._scene_player and not self._scene_player.running and self.play_btn.isChecked():
+            # Something else (e.g. the LCD page) took over the screen, or playback died.
+            err = self._scene_player.last_error or self._scene_player.lcd.last_error
+            if err:
+                self.log_message.emit(f"[ERROR] {err}")
+            self.log_message.emit("[INFO] Screen Designer: live playback was replaced or ended")
+            self.play_btn.setChecked(False)   # clicked, not toggled, drives _toggle_live: reset by hand
+            self.play_btn.setText("Start Live")
+            self._scene_player = None
         if self._scene_player and self._scene_player.running:
             if self._scene_player.last_frame is not None:
                 self.preview.set_image(self._scene_player.last_frame, metrics=sensors.read_all())
@@ -772,9 +780,11 @@ class ScreenDesignerPage(QWidget):
         if not device or not device.connected:
             self.log_message.emit("[ERROR] No device connected. Connect your AIO first.")
             return None
-        if not self._lcd_controller or self._lcd_controller.device != device:
-            self._lcd_controller = LCDController(device)
-            self._lcd_controller.refresh_info()
+        self._lcd_controller = LCDController.for_device(device)
+        try:
+            self._lcd_controller.ensure_info()
+        except Exception as e:
+            self.log_message.emit(f"[WARN] Could not read device info, using defaults: {e}")
         return self._lcd_controller
 
     def _toggle_live(self, checked: bool):

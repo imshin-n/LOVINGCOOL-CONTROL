@@ -257,7 +257,7 @@ class LCDPage(QWidget):
         """The LCD panel's fixed physical raster, auto-detected from the connected device."""
         device = self._get_device()
         if device and device.connected:
-            return device.spec.lcd_width, device.spec.lcd_height
+            return device.panel_size
         return 240, 240
 
     def _canvas_size(self) -> tuple[int, int]:
@@ -343,15 +343,18 @@ class LCDPage(QWidget):
         if not device or not device.connected:
             self.log_message.emit("[ERROR] No device connected. Connect your AIO first.")
             return None
-        if not self._lcd_controller or self._lcd_controller.device != device:
-            self._lcd_controller = LCDController(device)
-            self._lcd_controller.refresh_info()
+        self._lcd_controller = LCDController.for_device(device)
+        try:
+            self._lcd_controller.ensure_info()
+        except Exception as e:
+            self.log_message.emit(f"[WARN] Could not read device info, using defaults: {e}")
         return self._lcd_controller
 
     def _send_to_device(self):
         controller = self._ensure_controller()
         if not controller:
             return
+        controller.stop_playback()   # a still image/text replaces any GIF, video or live scene
 
         rotation = self._get_rotation()
 

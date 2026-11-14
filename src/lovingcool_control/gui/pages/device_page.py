@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from lovingcool_control.core.device import AIODevice, DeviceError, find_any_cooler_candidates, find_devices
+from lovingcool_control.core.lcd import LCDController
 
 log = logging.getLogger(__name__)
 
@@ -170,18 +171,27 @@ class DevicePage(QWidget):
             self.log_message.emit("[ERROR] No real device selected (placeholder VID:PID is 0x0000).")
             self.status_text.setText(
                 "No real device configured yet.\n\n"
-                "Run: python tools/enumerate.py\n"
-                "Then update core/device.py KNOWN_DEVICES with the real VID:PID."
+                "Run: uv run python tools/enumerate.py\n"
+                "Then add the VID:PID to devices.toml (see core/devices.toml)."
             )
             return
         try:
             dev.connect()
+            info_line = ""
+            if dev.spec.transport == "serial":
+                try:
+                    info = LCDController.for_device(dev).refresh_info()
+                    info_line = f"Model: {info.get('model', '?')}  firmware {info.get('version', '?')}\n"
+                except DeviceError as e:
+                    self.log_message.emit(f"[WARN] Connected, but the device didn't answer get_info: {e}")
             self._current_device = dev
             self.device_connected.emit(dev)
+            width, height = dev.panel_size
             self.status_text.setText(
                 f"Connected: {dev.spec.name}\n"
                 f"VID:PID = 0x{dev.spec.vid:04X}:0x{dev.spec.pid:04X}\n"
-                f"LCD: {dev.spec.lcd_width}x{dev.spec.lcd_height} {dev.spec.lcd_color_format}"
+                f"{info_line}"
+                f"LCD: {width}x{height} {dev.spec.lcd_color_format}"
             )
             self.log_message.emit(f"[OK] Connected to {dev.spec.name}")
         except DeviceError as e:
@@ -190,6 +200,7 @@ class DevicePage(QWidget):
 
     def _disconnect(self):
         if self._current_device:
+            LCDController.for_device(self._current_device).stop_playback()
             self._current_device.disconnect()
             self._current_device = None
             self.device_disconnected.emit()

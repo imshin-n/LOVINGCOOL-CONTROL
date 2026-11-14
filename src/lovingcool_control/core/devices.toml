@@ -1,0 +1,67 @@
+# lovingcool-control :: built-in device list
+#
+# Each [[device]] is matched by vid/pid against connected USB devices.
+# To add or override a device without editing this file, put entries in
+#   Linux:   ~/.config/lovingcool-control/devices.toml   (or $XDG_CONFIG_HOME)
+#   Windows: %APPDATA%\lovingcool-control\devices.toml
+#   macOS:   ~/Library/Application Support/lovingcool-control/devices.toml
+# An entry there with the same vid/pid replaces the built-in one.
+#
+# Fields (defaults in brackets):
+#   name, vid, pid                    required
+#   transport          "serial" | "hid"            ["hid"]
+#   baudrate           serial only                 [115200]
+#   dtr                assert DTR + DSR/DTR flow control on open [false]
+#   lcd_width/height   fallback panel size; the device's own get_info
+#                      reply wins once connected   [240 x 240]
+#   lcd_color_format   "JPEG" | "RGB565" | "BGR565" | "RGB888"  ["RGB565"]
+#   packet_size, report_id, interface   HID only
+#   cmd_*              command-channel opcodes (see core/protocol.py)
+#   tags               free-form labels
+#   verified           true once confirmed on real hardware [false]
+
+# Dongguan Hongtai "LOVINGCOOL MONITOR" firmware, 7" panel. Shows up as an
+# RT-Thread USB CDC-ACM serial port, not HID. Confirmed live:
+#   {"width":480,"height":320,"model":"txm818-7inch","version":"Ver1.0"}
+# At 2 Mbaud it drops bytes unless DTR flow control is on.
+[[device]]
+name = "Lovi.Cool AIO 7-inch (txm818)"
+vid = 0x33c3
+pid = 0x7788
+transport = "serial"
+baudrate = 2_000_000
+dtr = true
+lcd_width = 480
+lcd_height = 320
+lcd_color_format = "JPEG"
+tags = ["lcd"]
+verified = true
+
+# Lovingcool SC60, 4" square panel. Same vendor firmware family.
+[[device]]
+name = "Lovingcool SC60 4.0-inch"
+vid = 0x33c3
+pid = 0x7791
+transport = "serial"
+baudrate = 2_000_000
+dtr = false
+lcd_width = 480
+lcd_height = 480
+lcd_color_format = "JPEG"
+tags = ["lcd"]
+verified = false
+
+# The vendor app also whitelists PID 0x7797 on the same VID for sibling
+# brand builds; probably the same protocol, never tested:
+# [[device]]
+# name = "Lovingcool AIO (0x7797 variant)"
+# vid = 0x33c3
+# pid = 0x7797
+# transport = "serial"
+# baudrate = 2_000_000
+# dtr = true
+# lcd_color_format = "JPEG"
+#
+# RGB/fan lighting is a SEPARATE USB device on this product line (often a
+# CH340 USB-serial bridge, VID 0x1A86, or 0xA012 / 0xAA12) with a different
+# protocol; see core/rgb.py.

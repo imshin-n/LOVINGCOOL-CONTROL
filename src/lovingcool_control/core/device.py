@@ -1,21 +1,32 @@
 """
 lovingcool-control :: core/device.py
-============================
-Device discovery and connection management.
+====================================
+Device registry, discovery and the connection object.
 
-IMPORTANT: The VID/PID and protocol constants below are PLACEHOLDERS.
-Run tools/enumerate.py to find your device's actual VID:PID, then update
-KNOWN_DEVICES accordingly. The protocol fields (LCD_CMD, RGB_CMD etc.)
-must be reverse-engineered using tools/sniffer.py.
+The device list lives in devices.toml next to this file, plus an
+optional per-user override file (see load_device_specs()). The wire
+format is in core/protocol.py; this module does the I/O.
+
+Thread safety: one AIODevice is shared by everything that talks to the
+cooler (LCD playback threads, the GUI, the protocol lab). Every write,
+and every command's write+reply exchange, holds the device lock, so a
+background frame stream can never interleave bytes with a command or
+with another stream.
 """
 
 from __future__ import annotations
 
-import json
 import logging
+import os
+import sys
+import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass, field
+import tomllib
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields
+from importlib import resources
+from pathlib import Path
 
 try:
     import hid
@@ -28,12 +39,15 @@ try:
 except ImportError as e:
     raise ImportError("Install pyserial: pip install pyserial") from e
 
+from . import protocol
+
 log = logging.getLogger(__name__)
+
+APP_NAME = "lovingcool-control"
 
 
 # ──────────────────────────────────────────────────────────────
-#  Device Registry
-#  Add your VID:PID here after running tools/enumerate.py
+#  Device registry
 # ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -41,120 +55,109 @@ class DeviceSpec:
     name: str
     vid: int
     pid: int
-    # Transport: "hid" for USB HID devices (hidapi), "serial" for USB
-    # CDC-ACM virtual COM port devices (many cheap MCU-based AIO/RGB
-    # controllers — e.g. RT-Thread based boards — enumerate this way
-    # instead of as HID; check both with tools/enumerate.py).
+    # "hid" for USB HID (hidapi), "serial" for USB CDC-ACM virtual COM ports.
+    # The 33C3 LCD controllers are serial; check with tools/enumerate.py.
     transport: str = "hid"
-    baudrate: int = 115200   # only used when transport == "serial"
-    dtr: bool = False        # some MCU firmwares require DTR asserted to talk
-    # LCD properties. lcd_color_format="JPEG" means the device expects
-    # JPEG-encoded frames (see core/lcd.py) rather than raw pixel data.
+    baudrate: int = 115200   # serial only
+    dtr: bool = False        # assert DTR and enable DSR/DTR flow control on open
+    # Fallback panel size; AIODevice.panel_size prefers the device's own reply.
     lcd_width: int = 240
     lcd_height: int = 240
     lcd_color_format: str = "RGB565"   # or "RGB888", "BGR565", "JPEG"
-    # USB packet properties (HID transport only)
+    # HID only
     packet_size: int = 64
     report_id: int = 0x00
-    # Command-channel opcodes for the [0x55, 0xAA, len, key, payload, checksum]
-    # framed protocol (see AIODevice.send_command). CONFIRMED against real
-    # hardware for the 33C3:7788 family (Dongguan Hongtai "LOVINGCOOL
-    # MONITOR" firmware) by extracting and testing the vendor's own
-    # Electron app source (main/_baseClass/device.js) — not a guess.
+    interface: int = 0
+    # Command-channel opcodes (33C3:7788 family, from the vendor app source)
     cmd_restart: int = 0x01
     cmd_set_brightness: int = 0x03
     cmd_get_info: int = 0x06
-    cmd_commit: int = 0x11        # "start live" / flush, sent before streaming frames
+    cmd_commit: int = 0x11        # "start live", sent once before streaming frames
     cmd_close: int = 0x21
-    # Optional: interface number if device has multiple HID interfaces
-    interface: int = 0
-    # Extra tags for display
     tags: list[str] = field(default_factory=list)
+    verified: bool = False
+
+    @property
+    def usb_id(self) -> str:
+        return f"{self.vid:04x}:{self.pid:04x}"
 
 
-KNOWN_DEVICES: list[DeviceSpec] = [
-    # Found via tools/enumerate.py --serial: this unit's controller board
-    # exposes a USB CDC-ACM virtual COM port (RT-Thread RTOS USB stack),
-    # NOT a HID device — that's why plain hidapi enumeration never saw it.
-    #
-    # Protocol confirmed live against real hardware (see README) —
-    # getDeviceInfo (cmd_get_info) returned:
-    #   {"width":480,"height":320,"brightness":80,"model":"txm818-7inch",
-    #    "version":"Ver1.0","uid":"0C014F018787","region":"00000"}
-    DeviceSpec(
-        name="Lovi.Cool AIO (Dongguan Hongtai txm818-7inch)",
-        vid=0x33c3,
-        pid=0x7788,
-        transport="serial",
-        baudrate=2_000_000,   # confirmed: SerialPort({ baudRate: 0x1e8480, dtr: true })
-        dtr=True,
-        lcd_width=480,
-        lcd_height=320,
-        lcd_color_format="JPEG",
-        tags=["lcd"],
-    ),
-    # Lovingcool SC60 4.0-inch (VID 0x33C3, PID 0x7791)
-    DeviceSpec(
-        name="Lovingcool SC60 4.0-inch",
-        vid=0x33c3,
-        pid=0x7791,
-        transport="serial",
-        baudrate=2_000_000,
-        dtr=False,
-        lcd_width=480,
-        lcd_height=480,
-        lcd_color_format="JPEG",
-        tags=["lcd"],
-    ),
-    # This vendor's app also whitelists PIDs 7797 / 7791 for sibling brand
-    # builds (DELTA_CENTRO etc.) on the same VID — likely same protocol,
-    # unconfirmed on this hardware:
-    # DeviceSpec(name="Lovi.Cool AIO (variant)", vid=0x33c3, pid=0x7797, transport="serial", baudrate=2_000_000, dtr=True, lcd_color_format="JPEG"),
-    #
-    # RGB/fan lighting on this product line is a SEPARATE USB device (not
-    # the LCD controller above) — the vendor app looks for it on a
-    # different VID/PID whitelist entirely (commonly CH340-family USB-serial
-    # bridges: VID 0x1A86, or 0xA012 / 0xAA12). It did not enumerate on this
-    # machine, so it's either not wired to this unit's USB header or not
-    # connected. Run tools/enumerate.py --watch and plug in any second USB
-    # cable from the AIO to find it. See core/rgb.py.
-]
+_SPEC_FIELDS = {f.name for f in fields(DeviceSpec)}
+
+
+def user_config_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / APP_NAME
+
+
+def parse_device_specs(text: str, source: str = "<string>") -> list[DeviceSpec]:
+    """Parse a devices.toml document into DeviceSpecs. Unknown keys are an error, so typos surface."""
+    data = tomllib.loads(text)
+    specs = []
+    for i, entry in enumerate(data.get("device", [])):
+        unknown = set(entry) - _SPEC_FIELDS
+        if unknown:
+            raise ValueError(f"{source}: device #{i + 1}: unknown field(s) {sorted(unknown)}")
+        try:
+            specs.append(DeviceSpec(**entry))
+        except TypeError as e:
+            raise ValueError(f"{source}: device #{i + 1}: {e}") from e
+    return specs
+
+
+def load_device_specs(user_file: Path | None = None) -> list[DeviceSpec]:
+    """Built-in devices.toml, then the user's file; user entries replace built-ins with the same vid/pid."""
+    builtin = resources.files(__package__).joinpath("devices.toml").read_text("utf8")
+    merged = {(s.vid, s.pid): s for s in parse_device_specs(builtin, "devices.toml")}
+    user_file = user_file or user_config_dir() / "devices.toml"
+    if user_file.is_file():
+        try:
+            for s in parse_device_specs(user_file.read_text("utf8"), str(user_file)):
+                merged[(s.vid, s.pid)] = s
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as e:
+            log.error("Ignoring %s: %s", user_file, e)
+    return list(merged.values())
+
+
+KNOWN_DEVICES: list[DeviceSpec] = load_device_specs()
 
 
 # ──────────────────────────────────────────────────────────────
-#  Device Connection
+#  Connection
 # ──────────────────────────────────────────────────────────────
 
 class DeviceNotFoundError(Exception):
     pass
+
 
 class DeviceError(Exception):
     pass
 
 
 class AIODevice:
-    """
-    Wraps an HID connection to the cooler.
-
-    All raw USB writes go through send_packet(). Once the protocol is
-    known, higher-level methods (set_lcd_frame, set_rgb) will be built
-    on top of this.
-    """
+    """A connection to one cooler controller, over serial (CDC-ACM) or HID."""
 
     def __init__(self, spec: DeviceSpec):
         self.spec = spec
         self._dev: hid.device | serial.Serial | None = None
         self._connected = False
-        self._on_disconnect: Callable | None = None
+        self._on_disconnect: Callable[[], None] | None = None
+        self._lock = threading.RLock()
+        self.info: dict = {}   # last get_info() reply
 
     # ── Connection lifecycle ──────────────────────────────────
 
     def connect(self) -> None:
-        """Open the connection, using HID or serial depending on spec.transport."""
-        if self.spec.transport == "serial":
-            self._connect_serial()
-        else:
-            self._connect_hid()
+        with self._lock:
+            if self.spec.transport == "serial":
+                self._connect_serial()
+            else:
+                self._connect_hid()
 
     def _connect_hid(self) -> None:
         self._dev = hid.device()
@@ -162,8 +165,7 @@ class AIODevice:
             self._dev.open(self.spec.vid, self.spec.pid)
             self._dev.set_nonblocking(True)
             self._connected = True
-            log.info("Connected to %s (VID:PID=0x%04X:0x%04X)",
-                     self.spec.name, self.spec.vid, self.spec.pid)
+            log.info("Connected to %s (%s)", self.spec.name, self.spec.usb_id)
         except OSError as e:
             self._connected = False
             raise DeviceError(f"Cannot open device: {e}") from e
@@ -173,182 +175,163 @@ class AIODevice:
         if port is None:
             self._connected = False
             raise DeviceError(
-                f"No serial port found for VID:PID=0x{self.spec.vid:04X}:0x{self.spec.pid:04X} "
-                f"(device unplugged, or grabbed by another process — check ModemManager)"
+                f"No serial port found for {self.spec.usb_id} "
+                f"(device unplugged, or grabbed by another process; check ModemManager)"
             )
         try:
-            # dsrdtr=True: at 2Mbaud this device drops/corrupts bytes without
-            # DTR-based flow control enabled — confirmed by testing both ways
-            # against real hardware.
+            # dsrdtr: at 2 Mbaud the 7788 drops/corrupts bytes without DTR flow control.
             self._dev = serial.Serial(port, baudrate=self.spec.baudrate, timeout=0.1,
-                                       dsrdtr=self.spec.dtr)
+                                      dsrdtr=self.spec.dtr)
             if self.spec.dtr:
                 self._dev.dtr = True
                 time.sleep(0.2)   # let the MCU's USB-CDC stack settle after DTR
                 self._dev.reset_input_buffer()
             self._connected = True
-            log.info("Connected to %s (VID:PID=0x%04X:0x%04X) at %s",
-                      self.spec.name, self.spec.vid, self.spec.pid, port)
+            log.info("Connected to %s (%s) at %s", self.spec.name, self.spec.usb_id, port)
         except (OSError, serial.SerialException) as e:
             self._connected = False
             raise DeviceError(f"Cannot open serial port {port}: {e}") from e
 
     def disconnect(self) -> None:
-        if self._dev:
-            try:
-                self._dev.close()
-            except Exception:
-                pass
-            self._dev = None
-        self._connected = False
+        with self._lock:
+            if self._dev:
+                try:
+                    self._dev.close()
+                except Exception:
+                    pass
+                self._dev = None
+            self._connected = False
         log.info("Disconnected from %s", self.spec.name)
 
     @property
     def connected(self) -> bool:
         return self._connected
 
-    def on_disconnect(self, callback: Callable) -> None:
-        """Register a callback for when the device is disconnected."""
+    def on_disconnect(self, callback: Callable[[], None]) -> None:
+        """Register a callback for when an I/O error drops the connection."""
         self._on_disconnect = callback
+
+    @contextmanager
+    def exclusive(self) -> Iterator[AIODevice]:
+        """Hold the device lock across several operations (e.g. a multi-part frame)."""
+        with self._lock:
+            yield self
+
+    def _io_failed(self, what: str, e: Exception) -> DeviceError:
+        self._connected = False
+        if self._on_disconnect:
+            self._on_disconnect()
+        return DeviceError(f"{what} failed: {e}")
 
     # ── Raw packet I/O ───────────────────────────────────────
 
     def send_packet(self, payload: bytes) -> None:
         """
-        Send a raw payload to the device.
-
-        HID: prepends report ID and pads/truncates to packet_size (fixed-size
-        reports are a HID requirement).
-        Serial: writes the payload as-is — CDC-ACM is a plain byte stream,
-        there's no report framing to add.
+        Write one payload. Serial: as-is (CDC-ACM is a byte stream).
+        HID: report ID prepended, padded/truncated to packet_size.
         """
-        if not self._connected or not self._dev:
-            raise DeviceError("Device not connected")
-
-        if self.spec.transport == "serial":
-            packet = payload
-        else:
-            size = self.spec.packet_size
-            packet = bytes([self.spec.report_id]) + payload
-            if len(packet) < size + 1:
-                packet += bytes(size + 1 - len(packet))
-            else:
-                packet = packet[:size + 1]
-
-        log.debug("TX: %s", packet.hex(" "))
-        try:
-            self._dev.write(packet)
+        with self._lock:
+            if not self._connected or not self._dev:
+                raise DeviceError("Device not connected")
             if self.spec.transport == "serial":
-                self._dev.flush()
-        except (OSError, serial.SerialException) as e:
-            self._connected = False
-            if self._on_disconnect:
-                self._on_disconnect()
-            raise DeviceError(f"Write failed: {e}") from e
+                packet = payload
+            else:
+                size = self.spec.packet_size
+                packet = (bytes([self.spec.report_id]) + payload).ljust(size + 1, b"\0")[: size + 1]
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("TX %d bytes: %s", len(packet), packet[:64].hex(" "))
+            try:
+                self._dev.write(packet)
+                if self.spec.transport == "serial":
+                    self._dev.flush()
+            except (OSError, serial.SerialException) as e:
+                raise self._io_failed("Write", e) from e
 
     def read_packet(self, timeout_ms: int = 100) -> bytes | None:
-        """Read one incoming packet. Returns None on timeout."""
-        if not self._connected or not self._dev:
-            return None
-        try:
-            if self.spec.transport == "serial":
-                # Avoid reassigning .timeout unless it actually changes —
-                # pyserial reconfigures the port (tcsetattr) on every set,
-                # which is disruptive to reads at high baud rates.
-                new_timeout = timeout_ms / 1000.0
-                if self._dev.timeout != new_timeout:
-                    self._dev.timeout = new_timeout
-                data = self._dev.read(self.spec.packet_size)
-            else:
-                data = self._dev.read(self.spec.packet_size, timeout_ms=timeout_ms)
-            if data:
-                log.debug("RX: %s", bytes(data).hex(" "))
-                return bytes(data)
-        except (OSError, serial.SerialException) as e:
-            self._connected = False
-            if self._on_disconnect:
-                self._on_disconnect()
-            raise DeviceError(f"Read failed: {e}") from e
+        """Read whatever arrives within timeout_ms (protocol-lab use). None on timeout."""
+        with self._lock:
+            if not self._connected or not self._dev:
+                return None
+            try:
+                if self.spec.transport == "serial":
+                    # Only reassign .timeout when it changes: pyserial calls
+                    # tcsetattr on every set, which disturbs reads at 2 Mbaud.
+                    new_timeout = timeout_ms / 1000.0
+                    if self._dev.timeout != new_timeout:
+                        self._dev.timeout = new_timeout
+                    data = self._dev.read(self.spec.packet_size)
+                else:
+                    data = self._dev.read(self.spec.packet_size, timeout_ms=timeout_ms)
+            except (OSError, serial.SerialException) as e:
+                raise self._io_failed("Read", e) from e
+        if data:
+            log.debug("RX: %s", bytes(data).hex(" "))
+            return bytes(data)
         return None
 
-    def send_and_read(self, payload: bytes, retries: int = 3) -> bytes | None:
-        """Send a packet and wait for a response."""
-        self.send_packet(payload)
-        for _ in range(retries):
-            resp = self.read_packet(timeout_ms=200)
-            if resp:
-                return resp
-            time.sleep(0.05)
-        return None
+    # ── Command channel (serial, 33C3 family) ────────────────
 
-    # ── Command channel (confirmed protocol, 33C3:7788 family) ──
-    #
-    # Frame format: [0x55, 0xAA, lenLo, lenHi, key, ...payload, sumLo, sumHi]
-    #   len      = total frame length (payload length + 7 bytes of overhead)
-    #   checksum = sum of all preceding bytes (sync+len+key+payload) & 0xFFFF,
-    #              appended little-endian.
-    # Same framing is used for responses; the payload is UTF-8 JSON at
-    # bytes[5:-2]. Extracted from and verified against the vendor's own
-    # Electron app (main/_baseClass/device.js, handleData()/listen()).
-
-    @staticmethod
-    def _build_command_frame(key: int, payload: bytes = b"") -> bytes:
-        frame = bytes([0x55, 0xAA])
-        total_len = len(payload) + 7
-        frame += bytes([total_len % 256, total_len // 256, key]) + payload
-        checksum = sum(frame) & 0xFFFF
-        frame += bytes([checksum & 0xFF, (checksum >> 8) & 0xFF])
-        return frame
-
-    def _read_command_response(self, timeout_ms: int = 3000) -> bytes | None:
+    def _read_reply(self, timeout_ms: int) -> protocol.Frame | None:
         """
-        Read one full [0x55,0xAA,...] response frame off the serial link.
+        Collect bytes until one complete, checksum-valid frame arrives or the
+        deadline passes. Caller holds the lock.
 
-        NOTE: two things about this device's USB-CDC link at 2,000,000 baud
-        turned out to matter a lot (found by testing against real hardware):
-        - pyserial reconfigures the port (tcsetattr) every time `.timeout`
-          is assigned, which is disruptive if done inside a read loop.
-        - issuing back-to-back separate read() syscalls right after writing
-          (e.g. "read 5 bytes for the header, then read N more") reliably
-          returned a *shorter-than-actual* frame with a garbled length
-          field — some part of the response gets lost between the two
-          syscalls. Waiting briefly and doing a single bulk read of
-          whatever has arrived is reliable; the length field in the frame
-          is then only used to sanity-check what we already have, not to
-          drive a second precise read.
+        Found on real hardware: reading the header and then the body as two
+        exact-size reads straight after a write returned truncated frames.
+        A short pause followed by bulk reads of whatever has arrived is
+        reliable, so that's what this does, feeding everything through the
+        streaming parser instead of trusting a single read to hold the frame.
         """
-        if self.spec.transport != "serial" or not self._dev:
-            return None
-        self._dev.timeout = timeout_ms / 1000.0
+        parser = protocol.FrameParser()
+        deadline = time.monotonic() + timeout_ms / 1000.0
         time.sleep(0.15)
-        buf = self._dev.read(4096)
-        if len(buf) < 7 or buf[0] != 0x55 or buf[1] != 0xAA:
-            return None
-        return buf
+        while True:
+            try:
+                chunk = self._dev.read(4096)
+            except (OSError, serial.SerialException) as e:
+                raise self._io_failed("Read", e) from e
+            if chunk:
+                frames = parser.feed(chunk)
+                if frames:
+                    return frames[0]
+            if time.monotonic() >= deadline:
+                if parser.dropped:
+                    log.warning("Dropped %d corrupt reply frame(s)", parser.dropped)
+                return None
 
     def send_command(self, key: int, payload: bytes = b"",
-                      expect_response: bool = True, timeout_ms: int = 3000) -> dict | None:
-        """
-        Send a command-channel frame and (optionally) parse the JSON response.
-        Only implemented for transport="serial" on the confirmed protocol family.
-        """
-        frame = self._build_command_frame(key, payload)
-        self.send_packet(frame)
-        if not expect_response:
-            return None
-        raw = self._read_command_response(timeout_ms=timeout_ms)
-        if raw is None:
-            raise DeviceError(f"No response to command 0x{key:02X}")
-        body = raw[5:-2]
-        try:
-            return json.loads(body.decode("utf8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return {"raw": body.hex()}
+                     expect_response: bool = True, timeout_ms: int = 3000) -> dict | None:
+        """Send a command frame and, if expected, return its JSON reply."""
+        if self.spec.transport != "serial":
+            raise DeviceError("The command channel is only implemented for serial devices")
+        frame = protocol.build_frame(key, payload)
+        with self._lock:
+            if expect_response and self._dev is not None:
+                try:
+                    self._dev.reset_input_buffer()   # drop stale bytes from earlier traffic
+                except (OSError, serial.SerialException) as e:
+                    raise self._io_failed("Flush", e) from e
+            self.send_packet(frame)
+            if not expect_response:
+                return None
+            reply = self._read_reply(timeout_ms)
+        if reply is None:
+            raise DeviceError(f"No valid response to command 0x{key:02X}")
+        return reply.json()
 
     def get_info(self) -> dict:
-        """Query device info: width, height, brightness, model, version, uid, region."""
-        resp = self.send_command(self.spec.cmd_get_info)
-        return (resp or {}).get("data", {})
+        """Query width, height, brightness, model, version, uid, region. Cached in .info."""
+        resp = self.send_command(self.spec.cmd_get_info) or {}
+        self.info = resp.get("data", {}) if isinstance(resp.get("data"), dict) else {}
+        return self.info
+
+    @property
+    def panel_size(self) -> tuple[int, int]:
+        """Native panel raster: the device's own get_info reply if we have one, else the spec."""
+        w, h = self.info.get("width"), self.info.get("height")
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            return w, h
+        return self.spec.lcd_width, self.spec.lcd_height
 
     def set_brightness(self, percent: int) -> None:
         """Set LCD backlight brightness, 0-100."""
@@ -361,11 +344,11 @@ class AIODevice:
 
     def __repr__(self) -> str:
         state = "connected" if self._connected else "disconnected"
-        return f"<AIODevice {self.spec.name} VID:PID=0x{self.spec.vid:04X}:0x{self.spec.pid:04X} [{state}]>"
+        return f"<AIODevice {self.spec.name} {self.spec.usb_id} [{state}]>"
 
 
 # ──────────────────────────────────────────────────────────────
-#  Device Discovery
+#  Discovery
 # ──────────────────────────────────────────────────────────────
 
 def find_serial_port(vid: int, pid: int) -> str | None:
@@ -377,18 +360,10 @@ def find_serial_port(vid: int, pid: int) -> str | None:
 
 
 def find_devices(extra_specs: list[DeviceSpec] | None = None) -> list[AIODevice]:
-    """
-    Scan connected USB HID *and* USB-serial (CDC-ACM) devices and return
-    AIODevice instances for any that match KNOWN_DEVICES.
-    """
+    """Return an AIODevice for every connected USB HID or serial device matching a known spec."""
     specs = KNOWN_DEVICES + (extra_specs or [])
-    connected_hids = {
-        (d["vendor_id"], d["product_id"])
-        for d in hid.enumerate()
-    }
-    connected_serial = {
-        (p.vid, p.pid) for p in list_ports.comports() if p.vid is not None
-    }
+    connected_hids = {(d["vendor_id"], d["product_id"]) for d in hid.enumerate()}
+    connected_serial = {(p.vid, p.pid) for p in list_ports.comports() if p.vid is not None}
     found = []
     for spec in specs:
         key = (spec.vid, spec.pid)
@@ -403,8 +378,8 @@ def find_devices(extra_specs: list[DeviceSpec] | None = None) -> list[AIODevice]
 
 def find_any_cooler_candidates() -> list[dict]:
     """
-    Return raw HID + serial enumeration entries that look like they could
-    be an AIO controller — for the GUI's device discovery UI.
+    Raw HID + serial enumeration entries that look like they could be an
+    AIO controller, best match first. Used by the GUI's discovery list.
     """
     candidates = []
     keywords = ["cooler", "aio", "pump", "lcd", "cool", "lovi", "rt-thread", "rtt"]
@@ -412,9 +387,8 @@ def find_any_cooler_candidates() -> list[dict]:
     for d in hid.enumerate():
         prod = (d.get("product_string") or "").lower()
         mfr = (d.get("manufacturer_string") or "").lower()
-        usage_page = d.get("usage_page", 0)
         score = sum(10 for kw in keywords if kw in prod or kw in mfr)
-        if usage_page >= 0xFF00:
+        if d.get("usage_page", 0) >= 0xFF00:
             score += 5
         if score > 0:
             candidates.append({**d, "_transport": "hid", "_score": score})
@@ -424,20 +398,17 @@ def find_any_cooler_candidates() -> list[dict]:
             continue
         prod = (p.product or p.description or "").lower()
         mfr = (p.manufacturer or "").lower()
-        score = sum(10 for kw in keywords if kw in prod or kw in mfr)
-        # A USB-serial device with a real VID/PID (not a system UART) is
-        # already a decent candidate — these are invisible to hid.enumerate().
-        score += 3
-        if score > 0:
-            candidates.append({
-                "vendor_id": p.vid,
-                "product_id": p.pid,
-                "product_string": p.product or p.description,
-                "manufacturer_string": p.manufacturer,
-                "usage_page": 0,
-                "path": p.device,
-                "_transport": "serial",
-                "_score": score,
-            })
+        # Any USB-serial device with a real VID/PID is already a decent candidate.
+        score = 3 + sum(10 for kw in keywords if kw in prod or kw in mfr)
+        candidates.append({
+            "vendor_id": p.vid,
+            "product_id": p.pid,
+            "product_string": p.product or p.description,
+            "manufacturer_string": p.manufacturer,
+            "usage_page": 0,
+            "path": p.device,
+            "_transport": "serial",
+            "_score": score,
+        })
 
     return sorted(candidates, key=lambda x: x["_score"], reverse=True)

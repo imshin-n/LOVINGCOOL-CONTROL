@@ -27,6 +27,7 @@ uv run pyinstaller \
     --name lovingcool-control \
     --clean \
     --paths src \
+    --collect-data lovingcool_control \
     packaging/pyinstaller_entry.py
 
 echo "==> Bundling udev rules alongside the binary"

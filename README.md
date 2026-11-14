@@ -296,25 +296,32 @@ up, use watch mode and physically unplug/replug the AIO:
 uv run python tools/enumerate.py --watch
 ```
 
-Once you have the VID:PID (e.g. `0x0483:0x5750`), open `core/device.py` and
-update the `KNOWN_DEVICES` list. Set `transport="serial"` if your device
-showed up under "USB-serial (CDC-ACM) devices" instead of the HID list —
-leave it as the default `"hid"` otherwise:
+Once you have the VID:PID (e.g. `0x0483:0x5750`), add it to your own
+device file, no code changes needed:
 
-```python
-DeviceSpec(
-    name="Lovi.Cool AIO 240",
-    vid=0x0483,   # <- your real VID
-    pid=0x5750,   # <- your real PID
-    transport="serial",   # or "hid" — see which list it appeared in
-    lcd_width=240,
-    lcd_height=240,
-)
+- Linux: `~/.config/lovingcool-control/devices.toml`
+- Windows: `%APPDATA%\lovingcool-control\devices.toml`
+- macOS: `~/Library/Application Support/lovingcool-control/devices.toml`
+
+Set `transport = "serial"` if your device showed up under "USB-serial
+(CDC-ACM) devices" instead of the HID list:
+
+```toml
+[[device]]
+name = "Lovi.Cool AIO 240"
+vid = 0x0483          # your real VID
+pid = 0x5750          # your real PID
+transport = "serial"  # or "hid", depending on which list it appeared in
+baudrate = 2_000_000
+lcd_width = 240
+lcd_height = 240
+lcd_color_format = "JPEG"
 ```
 
-This repo's own unit enumerates as `0x33C3:0x7788` ("RT-Thread Team. RTT
-Virtual Serial") over CDC-ACM — already configured as the default entry
-in `KNOWN_DEVICES` as a working example.
+Entries there are merged with the built-in list in
+`src/lovingcool_control/core/devices.toml` (same VID:PID replaces the
+built-in entry), which documents every field and already contains the
+`0x33C3:0x7788` 7-inch unit and the `0x33C3:0x7791` SC60.
 
 ---
 
@@ -410,8 +417,9 @@ uv run lovingcool-control        # or: uv run python -m lovingcool_control
 
 1. **Device tab**: click Connect once your device appears in "Recognized Devices"
 2. **LCD Display tab**: pick an image/GIF/video or enter text, hit "Send to LCD" — the simple, single-shot path
-   (video via `opencv-python-headless`, same decode-and-loop pattern as GIF playback, sharing one
-   `LCDController._play_frames()` loop — see `core/lcd.py`). Has its own Landscape/Portrait toggle,
+   (video via `opencv-python-headless`, streamed frame by frame like GIF playback through
+   `LCDController.play_frames()`; see `core/lcd.py`). Only one thing plays at a time: starting a GIF,
+   video or live scene anywhere replaces whatever was playing. Has its own Landscape/Portrait toggle,
    same underlying `logical_canvas_size()`/`orient_for_device()` as Screen Designer (see below) —
    orientation isn't a Screen-Designer-only feature, both editing screens share it from `core/lcd.py`.
 3. **Screen Designer tab**: build a live, multi-layer screen (see below)
@@ -435,9 +443,9 @@ came from the device or a fallback default (shown before you've connected).
 - **Solid Color**
 - **Image** (PNG/JPG/BMP)
 - **GIF** — animated, frame timing from the GIF itself
-- **Video** (mp4/avi/mov/mkv/webm, via `opencv-python-headless`) — decoded
-  frame-by-frame at the video's own fps, capped at ~900 frames (~30s at
-  30fps) to keep memory bounded; longer clips just loop that window
+- **Video** (mp4/avi/mov/mkv/webm, via `opencv-python-headless`): decoded
+  lazily and downscaled to the panel as it plays, so any length or
+  resolution uses the same small amount of memory
 
 **Fit mode** (image/GIF/video sources): **Cover** (crop to fill, default),
 **Contain** (letterbox, nothing cropped), **Stretch** (distort to fill

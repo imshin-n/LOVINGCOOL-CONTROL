@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from lovingcool_control.core.lcd import LCDController
 from lovingcool_control.gui.pages.device_page import DevicePage
 from lovingcool_control.gui.pages.lcd_page import LCDPage
 from lovingcool_control.gui.pages.protocol_lab import ProtocolLabPage
@@ -177,9 +178,8 @@ class MainWindow(QMainWindow):
         log.info(message)
 
     def closeEvent(self, event):
-        if self.screen_page._scene_player:
-            self.screen_page._scene_player.stop()
         if self._current_device:
+            LCDController.for_device(self._current_device).stop_playback()
             self._current_device.disconnect()
         event.accept()
 

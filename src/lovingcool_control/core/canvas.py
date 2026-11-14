@@ -12,17 +12,24 @@ the GUI never blocks on sensor polling / JPEG encoding / serial I/O.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
+import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 from . import sensors
 from .lcd import (
+    Frame,
     LCDController,
+    cycle_frames,
+    iter_video_frames,
     load_gif_frames,
-    load_video_frames,
     logical_canvas_size,
     orient_for_device,
 )
@@ -70,20 +77,35 @@ class SceneConfig:
 #  Background loading
 # ──────────────────────────────────────────────────────────────
 
-def load_background_frames(cfg: BackgroundConfig) -> list[tuple[Image.Image, int]] | None:
+def open_background(cfg: BackgroundConfig, max_side: int | None = None) -> Iterator[Frame] | None:
     """
-    Returns a list of (frame, duration_ms) for animated backgrounds
-    (gif/video), a single-entry list for a static image, or None for a
-    solid color (rendered fresh each frame instead).
+    An endless (frame, duration_ms) stream for the background, or None for
+    a solid colour (drawn fresh each frame). Videos are decoded lazily and
+    downscaled to max_side, so a long or 4K video costs no extra memory.
     """
     if cfg.kind == "color" or not cfg.path:
         return None
     if cfg.kind == "gif":
-        return load_gif_frames(cfg.path)
+        return cycle_frames(load_gif_frames(cfg.path), loop=True)
     if cfg.kind == "video":
-        return load_video_frames(cfg.path)
-    # "image"
-    return [(Image.open(cfg.path), 0)]
+        return iter_video_frames(cfg.path, max_side=max_side, loop=True)
+    img = Image.open(cfg.path)
+    img.load()
+    return itertools.repeat((img, 0))
+
+
+@lru_cache(maxsize=8)
+def _preview_frame_cached(kind: str, path: str, mtime: float) -> Image.Image:
+    frames = open_background(BackgroundConfig(kind=kind, path=path), max_side=1024)
+    assert frames is not None
+    return next(frames)[0]
+
+
+def background_preview_frame(cfg: BackgroundConfig) -> Image.Image | None:
+    """First frame of the background, cached per file, for cheap static previews."""
+    if cfg.kind == "color" or not cfg.path:
+        return None
+    return _preview_frame_cached(cfg.kind, cfg.path, Path(cfg.path).stat().st_mtime)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -273,59 +295,62 @@ def render_frame(
 
 
 # ──────────────────────────────────────────────────────────────
-#  Live playback (background thread — mirrors LCDController.play_gif)
+#  Live playback (runs in the LCDController's single playback slot)
 # ──────────────────────────────────────────────────────────────
 
 class ScenePlayer:
-    """Continuously renders a SceneConfig and streams it to the LCD."""
+    """
+    Continuously renders a SceneConfig and streams it to the LCD.
+
+    It runs as the controller's playback, so starting a GIF or video
+    elsewhere stops the scene (and vice versa) instead of both writing to
+    the port at once.
+    """
 
     def __init__(self, lcd: LCDController):
         self.lcd = lcd
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+        self._stop: threading.Event | None = None
         self._cpu_history = sensors.CpuHistory()
         self.last_frame: Image.Image | None = None
         self.last_error: str | None = None
 
     @property
     def running(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
+        return self._stop is not None and not self._stop.is_set() and self.lcd.playing
 
     def start(self, cfg: SceneConfig) -> None:
-        self.stop()
-        bg_frames = load_background_frames(cfg.background)   # may raise — let caller handle
-        self._stop.clear()
+        self.lcd.ensure_info()
+        native_w, native_h = self.lcd.size
+        background = open_background(cfg.background, max_side=max(native_w, native_h))  # may raise
+        logical_w, logical_h = logical_canvas_size(native_w, native_h, cfg.orientation)
         self.last_error = None
 
-        def _loop():
-            idx = 0
-            native_w, native_h = self.lcd._width, self.lcd._height
-            while not self._stop.is_set():
-                bg = None
-                if bg_frames:
-                    bg, _duration_ms = bg_frames[idx % len(bg_frames)]
-                    idx += 1
+        def loop(stop: threading.Event) -> None:
+            interval = 1.0 / max(1, cfg.fps)
+            due = time.monotonic()
+            while not stop.is_set():
+                bg = next(background)[0] if background is not None else None
                 try:
-                    logical_w, logical_h = logical_canvas_size(native_w, native_h, cfg.orientation)
                     composed = compose_scene(cfg, logical_w, logical_h, bg, self._cpu_history)
-                    self.last_frame = composed   # what the GUI preview shows — same space as drag-editing
-                    device_frame = orient_for_device(composed, native_w, native_h, cfg.orientation, cfg.transparent_fill)
-                    self.lcd.send_image(device_frame)
+                    self.last_frame = composed   # the GUI preview shows this (same space as drag-editing)
+                    self.lcd.send_frame(orient_for_device(composed, native_w, native_h,
+                                                          cfg.orientation, cfg.transparent_fill))
                 except Exception as e:
                     self.last_error = str(e)
                     log.error("Scene playback error: %s", e)
-                self._stop.wait(timeout=1.0 / max(1, cfg.fps))
+                    if not self.lcd.device.connected:
+                        return
+                due = max(due + interval, time.monotonic())
+                stop.wait(due - time.monotonic())
 
-        self._thread = threading.Thread(target=_loop, daemon=True, name="scene-player")
-        self._thread.start()
+        self._stop = self.lcd.start_playback(loop, "scene-player")
 
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        self._thread = None
-        if self.lcd:
+        """Stop the scene if it is still the active playback (leave a replacement alone)."""
+        if self.running:
+            self.lcd.stop_playback()
             try:
                 self.lcd.stop()
             except Exception:
                 pass
+        self._stop = None

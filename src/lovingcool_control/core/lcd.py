@@ -1,22 +1,21 @@
 """
 lovingcool-control :: core/lcd.py
-=========================
-Image, GIF, and text -> USB frame pipeline.
+=================================
+Image, GIF, video and text -> LCD frame pipeline.
 
-Protocol confirmed against real hardware (33C3:7788, "txm818-7inch",
-firmware "Ver1.0") by extracting the vendor's own Electron app source
-(see README). This device's LCD channel expects JPEG-encoded frames,
-not raw pixel data:
+Protocol (confirmed on 33C3:7788 "txm818-7inch", firmware "Ver1.0", from
+the vendor's Electron app source; see README). The LCD channel takes
+JPEG frames, not raw pixels:
 
-  1. Once per connection: send command key=0x11 ("commit"/start-live)
-     over the command channel (AIODevice.send_command).
-  2. For each frame: resize to the panel's native resolution, JPEG-encode
-     at the highest quality that fits under a size cap (firmware-version
-     dependent, ~50KB by default), and write the raw JPEG bytes straight
-     to the serial port — no chunk headers, no per-chunk framing.
-     Firmware versions > 2.8 additionally wrap the JPEG in a
-     [4-byte LE length][jpeg][2-byte LE checksum] envelope; "Ver1.0"
-     (this unit) does not use that wrapper.
+  1. Once per live session: command 0x11 ("commit" / start live).
+  2. Per frame: resize to the panel's native raster, JPEG-encode at the
+     highest quality that fits a size cap (~50 KB by default), and write
+     the JPEG bytes straight to the serial port. Firmware > 2.8 wraps the
+     JPEG as [4-byte LE length][jpeg][2-byte LE checksum]; Ver1.0 doesn't.
+
+One LCDController exists per device (LCDController.for_device), and it
+runs at most one playback (GIF, video or live scene) at a time: starting
+a new one stops the old one, so two streams never fight over the port.
 """
 
 from __future__ import annotations
@@ -25,12 +24,13 @@ import io
 import logging
 import re
 import threading
+import time
+import weakref
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
-try:
-    from PIL import Image, ImageDraw, ImageFont, ImageSequence
-except ImportError as e:
-    raise ImportError("Install Pillow: pip install Pillow") from e
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageSequence
 
 try:
     import cv2
@@ -38,50 +38,39 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
-from .device import AIODevice
-
-MAX_VIDEO_FRAMES = 900   # ~30s at 30fps — cap to avoid unbounded memory use
+from .device import AIODevice, DeviceError
 
 log = logging.getLogger(__name__)
 
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+
+Frame = tuple[Image.Image, int]   # (image, duration_ms)
+
 
 # ──────────────────────────────────────────────────────────────
-#  Color Format Encoding
+#  Encoding
 # ──────────────────────────────────────────────────────────────
+
+def _rgb_array(img: Image.Image) -> np.ndarray:
+    return np.asarray(img.convert("RGB"), dtype=np.uint16)
+
 
 def image_to_rgb565(img: Image.Image) -> bytes:
-    """Convert a PIL Image (RGB) to raw RGB565 little-endian bytes."""
-    img = img.convert("RGB")
-    pixels = list(img.getdata())
-    out = bytearray(len(pixels) * 2)
-    for i, (r, g, b) in enumerate(pixels):
-        r5 = (r >> 3) & 0x1F
-        g6 = (g >> 2) & 0x3F
-        b5 = (b >> 3) & 0x1F
-        rgb565 = (r5 << 11) | (g6 << 5) | b5
-        out[i*2]   = rgb565 & 0xFF
-        out[i*2+1] = (rgb565 >> 8) & 0xFF
-    return bytes(out)
-
-
-def image_to_rgb888(img: Image.Image) -> bytes:
-    """Convert a PIL Image to raw RGB888 bytes."""
-    return img.convert("RGB").tobytes()
+    """RGB565, little-endian."""
+    a = _rgb_array(img)
+    v = ((a[..., 0] >> 3) << 11) | ((a[..., 1] >> 2) << 5) | (a[..., 2] >> 3)
+    return v.astype("<u2").tobytes()
 
 
 def image_to_bgr565(img: Image.Image) -> bytes:
-    """Convert to BGR565 (some controllers use reversed byte order)."""
-    img = img.convert("RGB")
-    pixels = list(img.getdata())
-    out = bytearray(len(pixels) * 2)
-    for i, (r, g, b) in enumerate(pixels):
-        b5 = (b >> 3) & 0x1F
-        g6 = (g >> 2) & 0x3F
-        r5 = (r >> 3) & 0x1F
-        bgr565 = (b5 << 11) | (g6 << 5) | r5
-        out[i*2]   = bgr565 & 0xFF
-        out[i*2+1] = (bgr565 >> 8) & 0xFF
-    return bytes(out)
+    """BGR565, little-endian (red and blue swapped)."""
+    a = _rgb_array(img)
+    v = ((a[..., 2] >> 3) << 11) | ((a[..., 1] >> 2) << 5) | (a[..., 0] >> 3)
+    return v.astype("<u2").tobytes()
+
+
+def image_to_rgb888(img: Image.Image) -> bytes:
+    return img.convert("RGB").tobytes()
 
 
 FORMAT_ENCODERS = {
@@ -91,106 +80,124 @@ FORMAT_ENCODERS = {
 }
 
 
-def encode_jpeg_capped(img: Image.Image, max_size_kb: float, quality: int = 100) -> bytes:
+def fit_jpeg(img: Image.Image, max_size_kb: float, hint: int | None = None) -> tuple[bytes, int]:
     """
-    JPEG-encode an image, stepping quality down until it fits under
-    max_size_kb. Mirrors the vendor app's getSizeBt(): quality -= 2 per
-    retry, floor of 1.
+    JPEG-encode at the highest quality (1-100) whose output fits max_size_kb.
+    Returns (data, quality). If even quality 1 is too big, returns quality 1
+    anyway, as the vendor app does.
+
+    Binary search: about 7 encodes worst case, instead of the up-to-50 of
+    stepping down by 2 from 100. Passing the previous frame's quality as
+    `hint` usually settles it in 2 encodes, since consecutive frames of a
+    video or scene compress alike.
     """
     img = img.convert("RGB")
-    while True:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-        data = buf.getvalue()
-        if len(data) / 1024 <= max_size_kb or quality <= 1:
-            return data
-        quality = max(1, quality - 2)
+    limit = max_size_kb * 1024
+    cache: dict[int, bytes] = {}
+
+    def enc(q: int) -> bytes:
+        if q not in cache:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q)
+            cache[q] = buf.getvalue()
+        return cache[q]
+
+    def fits(q: int) -> bool:
+        return len(enc(q)) <= limit
+
+    lo, hi = 1, 100
+    if hint is not None and 1 <= hint <= 100:
+        if fits(hint):
+            if hint == 100 or not fits(hint + 1):
+                return enc(hint), hint
+            lo = hint + 1
+        else:
+            if hint > 1 and fits(hint - 1):
+                return enc(hint - 1), hint - 1
+            hi = max(1, hint - 2)
+    # Invariant: the answer is in [lo, hi] (or 1 if nothing fits).
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return enc(lo), lo
+
+
+def encode_jpeg_capped(img: Image.Image, max_size_kb: float) -> bytes:
+    """JPEG at the highest quality that fits max_size_kb (see fit_jpeg)."""
+    return fit_jpeg(img, max_size_kb)[0]
 
 
 # ──────────────────────────────────────────────────────────────
-#  Image Processing
+#  Sources: images, GIFs, video, text
 # ──────────────────────────────────────────────────────────────
-
-def prepare_image(
-    img: Image.Image,
-    width: int,
-    height: int,
-    color_format: str = "RGB565",
-    rotation: int = 0,
-) -> bytes:
-    """
-    Resize, rotate and encode an image to the device's pixel format.
-    Returns raw bytes ready for USB transmission.
-    """
-    img = img.convert("RGB")
-
-    if rotation:
-        img = img.rotate(-rotation, expand=False)
-
-    img = img.resize((width, height), Image.LANCZOS)
-
-    encoder = FORMAT_ENCODERS.get(color_format, image_to_rgb565)
-    return encoder(img)
-
 
 def load_image(path: str | Path) -> Image.Image:
     return Image.open(path)
 
 
-def load_gif_frames(path: str | Path) -> list[tuple[Image.Image, int]]:
-    """
-    Returns list of (frame, duration_ms) tuples.
-    """
+def load_gif_frames(path: str | Path) -> list[Frame]:
+    """All frames of a GIF as (frame, duration_ms)."""
     gif = Image.open(path)
-    frames = []
-    for frame in ImageSequence.Iterator(gif):
-        duration = frame.info.get("duration", 100)  # ms
-        frames.append((frame.copy(), duration))
-    return frames
+    return [(frame.copy(), frame.info.get("duration", 100)) for frame in ImageSequence.Iterator(gif)]
 
 
-def load_video_frames(path: str | Path) -> list[tuple[Image.Image, int]]:
-    """Decode a video file to (frame, duration_ms) pairs, RGB, capped at MAX_VIDEO_FRAMES."""
+def _require_cv2(purpose: str) -> None:
     if not CV2_AVAILABLE:
-        raise RuntimeError("Video playback needs opencv-python-headless: pip install opencv-python-headless")
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    duration_ms = max(1, int(1000 / fps))
-    frames: list[tuple[Image.Image, int]] = []
-    try:
-        while len(frames) < MAX_VIDEO_FRAMES:
-            ok, frame_bgr = cap.read()
-            if not ok:
-                break
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frames.append((Image.fromarray(frame_rgb), duration_ms))
-    finally:
-        cap.release()
-    if not frames:
-        raise RuntimeError(f"No frames decoded from video: {path}")
-    log.info("Loaded %d video frames from %s", len(frames), path)
-    return frames
+        raise RuntimeError(f"{purpose} needs opencv-python-headless: pip install opencv-python-headless")
+
+
+def iter_video_frames(path: str | Path, max_side: int | None = None, loop: bool = False) -> Iterator[Frame]:
+    """
+    Decode a video lazily, one frame at a time, as (RGB image, duration_ms).
+
+    Frames are downscaled while decoding so the longer side is at most
+    max_side, which keeps memory flat no matter how long or large the
+    video is. With loop=True the file is reopened at the end, forever.
+    """
+    _require_cv2("Video playback")
+    while True:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {path}")
+        produced = False
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+            duration_ms = max(1, round(1000 / fps))
+            while True:
+                ok, frame_bgr = cap.read()
+                if not ok:
+                    break
+                if max_side:
+                    h, w = frame_bgr.shape[:2]
+                    scale = max_side / max(w, h)
+                    if scale < 1:
+                        frame_bgr = cv2.resize(frame_bgr, (max(1, round(w * scale)), max(1, round(h * scale))),
+                                               interpolation=cv2.INTER_AREA)
+                produced = True
+                yield Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)), duration_ms
+        finally:
+            cap.release()
+        if not produced:
+            raise RuntimeError(f"No frames decoded from video: {path}")
+        if not loop:
+            return
 
 
 def load_video_thumbnail(path: str | Path) -> Image.Image:
-    """Grab just the first frame of a video — for a lightweight preview thumbnail."""
-    if not CV2_AVAILABLE:
-        raise RuntimeError("Video preview needs opencv-python-headless: pip install opencv-python-headless")
-    cap = cv2.VideoCapture(str(path))
-    try:
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video: {path}")
-        ok, frame_bgr = cap.read()
-        if not ok:
-            raise RuntimeError(f"Could not read a frame from video: {path}")
-        return Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    finally:
-        cap.release()
+    """Just the first frame of a video, for a preview."""
+    _require_cv2("Video preview")
+    return next(iter_video_frames(path))[0]
 
 
-VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm")
+def cycle_frames(frames: list[Frame], loop: bool) -> Iterator[Frame]:
+    """Yield a finite frame list once, or forever."""
+    while True:
+        yield from frames
+        if not loop or not frames:
+            return
 
 
 def render_text_image(
@@ -202,40 +209,30 @@ def render_text_image(
     bg_color: tuple = (0, 0, 0),
     font_path: str | None = None,
 ) -> Image.Image:
-    """Render text onto a blank image (for LCD display)."""
+    """Render centred text onto a blank image."""
     img = Image.new("RGB", (width, height), bg_color)
     draw = ImageDraw.Draw(img)
     try:
-        if font_path:
-            font = ImageFont.truetype(font_path, font_size)
-        else:
-            font = ImageFont.load_default()
+        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default(font_size)
     except Exception:
         font = ImageFont.load_default()
-
-    # Center the text
     bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    x = (width - tw) // 2
-    y = (height - th) // 2
+    x = (width - (bbox[2] - bbox[0])) // 2 - bbox[0]
+    y = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
     draw.text((x, y), text, fill=fg_color, font=font)
     return img
 
 
 # ──────────────────────────────────────────────────────────────
-#  Orientation (landscape/portrait) — shared with core/canvas.py
+#  Orientation (landscape/portrait), shared with core/canvas.py
 # ──────────────────────────────────────────────────────────────
 
 def logical_canvas_size(device_width: int, device_height: int, orientation: str) -> tuple[int, int]:
     """
-    The LCD panel's raster is a fixed physical shape (device_width x
-    device_height). "Portrait" doesn't change that raster — it changes
-    which aspect ratio content is composed/edited at, so a tall layout
-    reads correctly once the whole frame is rotated 90 degrees into the
-    panel's native buffer at send time (see orient_for_device()). This is
-    the size any preview/editor should use, and what widget or text
-    positions are relative to.
+    The panel's raster is fixed (device_width x device_height). "Portrait"
+    means content is composed on a swapped-aspect canvas and the finished
+    frame is rotated 90 degrees into the native buffer at send time (see
+    orient_for_device). Editors and previews work at this logical size.
     """
     if orientation == "portrait":
         return device_height, device_width
@@ -249,202 +246,238 @@ def orient_for_device(
     orientation: str,
     fill_color: tuple[int, int, int] = (0, 0, 0),
 ) -> Image.Image:
-    """
-    Take a frame composed at the logical (already-oriented) size and
-    produce the final image at the device's fixed native raster size,
-    ready to send. In portrait mode the logical canvas is already
-    device_height x device_width, so a 90-degree expand rotate swaps it
-    right back to device_width x device_height.
-    """
+    """Turn a frame composed at the logical size into one at the native raster size."""
     if orientation == "portrait":
-        rotated = composed.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=fill_color)
-        if rotated.size != (device_width, device_height):
-            rotated = rotated.resize((device_width, device_height), Image.LANCZOS)
-        return rotated
+        composed = composed.rotate(90, resample=Image.BICUBIC, expand=True, fillcolor=fill_color)
     if composed.size != (device_width, device_height):
         composed = composed.resize((device_width, device_height), Image.LANCZOS)
     return composed
 
 
 # ──────────────────────────────────────────────────────────────
-#  USB Frame Transmission
+#  Controller
 # ──────────────────────────────────────────────────────────────
 
 class LCDController:
     """
-    Manages sending frames to the LCD.
+    Sends frames to one device's LCD and owns its single playback thread.
 
-    Two device families, both confirmed against the vendor's own app source:
+    Get it with LCDController.for_device(device) so every part of the app
+    shares one controller (and so one playback) per device.
 
-    - lcd_color_format == "JPEG" (this project's confirmed unit, and any
-      33C3:7788-family device): each frame is a JPEG blob written directly
-      to the serial port, after one "commit" command (cmd_commit) sent
-      once per connection. No chunk headers.
-    - Anything else: legacy raw-pixel path (RGB565/BGR565/RGB888),
-      chunked over HID-style fixed-size packets — unverified guesswork,
-      kept for HID-transport devices that don't match the JPEG family.
+    JPEG devices (the confirmed 33C3 family) get one JPEG per frame after
+    a one-time commit. Other formats use a legacy chunked raw-pixel path
+    that has never been verified on hardware.
     """
 
-    DEFAULT_MAX_JPEG_KB = 50   # matches vendor default for version <= 2.8
+    DEFAULT_MAX_JPEG_KB = 50   # vendor default for firmware <= 2.8
+
+    _instances: weakref.WeakKeyDictionary[AIODevice, LCDController] = weakref.WeakKeyDictionary()
+    _instances_lock = threading.Lock()
+
+    @classmethod
+    def for_device(cls, device: AIODevice) -> LCDController:
+        with cls._instances_lock:
+            ctl = cls._instances.get(device)
+            if ctl is None:
+                ctl = cls._instances[device] = cls(device)
+            return ctl
 
     def __init__(self, device: AIODevice):
         self.device = device
-        self._gif_thread: threading.Thread | None = None
-        self._stop_gif = threading.Event()
         self._color_format = device.spec.lcd_color_format
-        self._width = device.spec.lcd_width
-        self._height = device.spec.lcd_height
         self._live_started = False
-        self._use_frame_wrapper = False   # set by refresh_info() if fw version > 2.8
+        self._use_frame_wrapper = False   # set by refresh_info() for firmware > 2.8
         self._max_jpeg_kb = self.DEFAULT_MAX_JPEG_KB
+        self._jpeg_quality_hint: int | None = None
+        self._info_loaded = False
+        # Playback (one at a time)
+        self._play_thread: threading.Thread | None = None
+        self._play_stop = threading.Event()
+        self._play_lock = threading.Lock()
+        self.last_error: str | None = None
 
-    # ── Device info / live-session setup ──────────────────────
+    # ── Device info ───────────────────────────────────────────
+
+    @property
+    def size(self) -> tuple[int, int]:
+        """Native panel raster (width, height)."""
+        return self.device.panel_size
 
     def refresh_info(self) -> dict:
-        """Query the device and update width/height/version-dependent behavior."""
-        info = self.device.get_info()
-        if info:
-            self._width = info.get("width", self._width)
-            self._height = info.get("height", self._height)
-            version = str(info.get("version", ""))
-            match = re.search(r"[\d.]+", version)
-            version_num = float(match.group()) if match else None
-            self._use_frame_wrapper = version_num is not None and version_num > 2.8
+        """Query the device; sets panel size (via the device) and firmware-dependent framing."""
+        info = self.device.get_info() if self.device.spec.transport == "serial" else {}
+        match = re.search(r"\d+(?:\.\d+)?", str(info.get("version", "")))
+        version = float(match.group()) if match else None
+        self._use_frame_wrapper = version is not None and version > 2.8
+        self._info_loaded = True
+        log.info("LCD info: %s (panel %dx%d, frame wrapper %s)", info, *self.size, self._use_frame_wrapper)
         return info
 
-    def _ensure_live(self) -> None:
-        """Send the one-time 'commit'/start-live command before streaming frames."""
-        if not self._live_started:
-            self.device.send_command(self.device.spec.cmd_commit, expect_response=False)
-            self._live_started = True
+    def ensure_info(self) -> None:
+        if not self._info_loaded:
+            self.refresh_info()
 
-    # ── JPEG frame transmission (confirmed protocol) ──────────
+    # ── Low-level sending ─────────────────────────────────────
 
     def _build_jpeg_frame(self, jpeg_bytes: bytes) -> bytes:
         if not self._use_frame_wrapper:
             return jpeg_bytes
-        length = len(jpeg_bytes)
-        header = bytes([length & 0xFF, (length >> 8) & 0xFF, (length >> 16) & 0xFF, (length >> 24) & 0xFF])
-        body = header + jpeg_bytes
-        checksum = sum(body) & 0xFFFF
-        return body + bytes([checksum & 0xFF, (checksum >> 8) & 0xFF])
+        body = len(jpeg_bytes).to_bytes(4, "little") + jpeg_bytes
+        return body + (sum(body) & 0xFFFF).to_bytes(2, "little")
 
     def send_raw_jpeg_frame(self, jpeg_bytes: bytes) -> None:
-        """Send one already-encoded JPEG frame to the LCD."""
-        self._ensure_live()
-        self.device.send_packet(self._build_jpeg_frame(jpeg_bytes))
+        """Send one already-encoded JPEG (commit first if this live session hasn't)."""
+        with self.device.exclusive():
+            if not self._live_started:
+                self.device.send_command(self.device.spec.cmd_commit, expect_response=False)
+                self._live_started = True
+            self.device.send_packet(self._build_jpeg_frame(jpeg_bytes))
+
+    def send_raw_frame(self, pixel_data: bytes) -> None:
+        """Legacy chunked raw-pixel transmission (unverified; see class docstring)."""
+        spec = self.device.spec
+        chunk_size = 60
+        with self.device.exclusive():
+            self.device.send_packet(bytes([spec.cmd_commit, 0x00] + [0x00] * 62))
+            for seq, offset in enumerate(range(0, len(pixel_data), chunk_size)):
+                header = bytes([spec.cmd_commit, (seq >> 8) & 0xFF, seq & 0xFF, 0x00])
+                self.device.send_packet((header + pixel_data[offset:offset + chunk_size]).ljust(64, b"\0"))
 
     def stop(self) -> None:
-        """Stop live streaming. Resets state so the next send_image() re-commits."""
-        if self._use_frame_wrapper:
-            # Vendor app resets the device's image stream with a double
-            # JPEG-EOI sentinel before other operations once live has run.
+        """End the live session; the next frame re-sends the commit."""
+        if self._use_frame_wrapper and self.device.connected:
+            # The vendor app resets the image stream with a double JPEG EOI.
             self.device.send_packet(bytes([0xFF, 0xD9, 0xFF, 0xD9]))
         self._live_started = False
 
-    # ── Legacy raw-pixel path (unverified, HID-style transports) ─
+    # ── Frames ────────────────────────────────────────────────
 
-    def send_raw_frame(self, pixel_data: bytes) -> None:
-        """Legacy chunked raw-pixel transmission — see class docstring."""
-        spec = self.device.spec
-        chunk_size = 60
-        self.device.send_packet(bytes([spec.cmd_commit, 0x00] + [0x00] * 62))
-        for seq, offset in enumerate(range(0, len(pixel_data), chunk_size)):
-            chunk = pixel_data[offset:offset + chunk_size]
-            header = bytes([spec.cmd_commit, (seq >> 8) & 0xFF, seq & 0xFF, 0x00])
-            payload = header + chunk
-            if len(payload) < 64:
-                payload += bytes(64 - len(payload))
-            self.device.send_packet(payload)
-        log.debug("Raw frame sent: %d bytes", len(pixel_data))
-
-    # ── Public API ────────────────────────────────────────────
-
-    def send_image(self, img: Image.Image, rotation: int = 0, orientation: str = "landscape") -> None:
-        """
-        Encode and send a PIL image.
-
-        orientation="landscape" (default) composes at the panel's native
-        aspect. orientation="portrait" composes on a swapped-aspect
-        canvas (so content isn't distorted/cropped) and rotates the whole
-        frame 90 degrees into the panel's native buffer at the end —
-        same approach as core.canvas's Screen Designer. `rotation` is a
-        separate fine-tune applied on top of orientation, within the
-        logical (already-oriented) canvas.
-        """
+    def prepare(self, img: Image.Image, rotation: int = 0, orientation: str = "landscape") -> Image.Image:
+        """Fit an image to the logical canvas, apply fine rotation, then orient to the native raster."""
+        width, height = self.size
+        logical_w, logical_h = logical_canvas_size(width, height, orientation)
         img = img.convert("RGB")
-        logical_w, logical_h = logical_canvas_size(self._width, self._height, orientation)
-        img = img.resize((logical_w, logical_h), Image.LANCZOS)
-        if rotation % 360 != 0:
+        if img.size != (logical_w, logical_h):
+            img = img.resize((logical_w, logical_h), Image.LANCZOS)
+        if rotation % 360:
             img = img.rotate(-rotation, resample=Image.BICUBIC, expand=False)
-        img = orient_for_device(img, self._width, self._height, orientation)
+        return orient_for_device(img, width, height, orientation)
 
+    def send_frame(self, native: Image.Image) -> None:
+        """Encode and send an image that is already at the native raster size."""
         if self._color_format == "JPEG":
-            jpeg_bytes = encode_jpeg_capped(img, self._max_jpeg_kb)
-            self.send_raw_jpeg_frame(jpeg_bytes)
+            data, self._jpeg_quality_hint = fit_jpeg(native, self._max_jpeg_kb, self._jpeg_quality_hint)
+            self.send_raw_jpeg_frame(data)
         else:
             encoder = FORMAT_ENCODERS.get(self._color_format, image_to_rgb565)
-            self.send_raw_frame(encoder(img))
+            self.send_raw_frame(encoder(native))
+
+    def send_image(self, img: Image.Image, rotation: int = 0, orientation: str = "landscape") -> None:
+        """Resize/orient a PIL image for the panel and send it."""
+        self.ensure_info()
+        self.send_frame(self.prepare(img, rotation, orientation))
 
     def send_image_file(self, path: str | Path, rotation: int = 0, orientation: str = "landscape") -> None:
-        """Load an image file and send it."""
         self.send_image(load_image(path), rotation, orientation)
 
-    def send_text(
-        self,
-        text: str,
-        font_size: int = 40,
-        fg: tuple = (255, 255, 255),
-        bg: tuple = (0, 0, 0),
-        orientation: str = "landscape",
-    ) -> None:
-        """Render text and send it to the LCD."""
-        w, h = logical_canvas_size(self._width, self._height, orientation)
-        img = render_text_image(text, w, h, font_size, fg, bg)
-        self.send_image(img, orientation=orientation)
+    def send_text(self, text: str, font_size: int = 40, fg: tuple = (255, 255, 255),
+                  bg: tuple = (0, 0, 0), orientation: str = "landscape") -> None:
+        self.ensure_info()
+        w, h = logical_canvas_size(*self.size, orientation)
+        self.send_image(render_text_image(text, w, h, font_size, fg, bg), orientation=orientation)
 
-    # ── Animated playback (GIF or video) ──────────────────────
+    # ── Playback (one at a time) ──────────────────────────────
 
-    def _play_frames(self, frames: list[tuple[Image.Image, int]], loop: bool,
-                      rotation: int, orientation: str, thread_name: str) -> None:
-        """Shared playback loop for play_gif()/play_video() — one frame at a time, on a background thread."""
-        self.stop_gif()
-        self._stop_gif.clear()
+    @property
+    def playing(self) -> bool:
+        return bool(self._play_thread and self._play_thread.is_alive())
 
-        def _play():
-            while not self._stop_gif.is_set():
-                for img, duration_ms in frames:
-                    if self._stop_gif.is_set():
-                        break
-                    self.send_image(img, rotation, orientation)
-                    self._stop_gif.wait(timeout=max(duration_ms, 1) / 1000.0)
-                if not loop:
-                    break
+    def start_playback(self, target: Callable[[threading.Event], None], name: str) -> threading.Event:
+        """
+        Stop whatever is playing, then run target(stop_event) on a background
+        thread. target should return promptly once stop_event is set. Returns
+        that event: it gets set when this playback is stopped or replaced.
+        """
+        with self._play_lock:
+            self._stop_playback_locked()
+            self.ensure_info()
+            stop = threading.Event()
+            self._play_stop = stop
+            self.last_error = None
 
-        self._gif_thread = threading.Thread(target=_play, daemon=True, name=thread_name)
-        self._gif_thread.start()
+            def run() -> None:
+                try:
+                    target(stop)
+                except DeviceError as e:
+                    self.last_error = str(e)
+                    log.error("%s stopped: %s", name, e)
+                except Exception as e:
+                    self.last_error = str(e)
+                    log.exception("%s crashed", name)
+
+            self._play_thread = threading.Thread(target=run, daemon=True, name=name)
+            self._play_thread.start()
+            return stop
+
+    def stop_playback(self) -> None:
+        with self._play_lock:
+            self._stop_playback_locked()
+
+    def _stop_playback_locked(self) -> None:
+        self._play_stop.set()
+        t = self._play_thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=3.0)
+            if t.is_alive():
+                log.warning("Playback thread %s did not stop within 3s", t.name)
+        self._play_thread = None
+
+    stop_gif = stop_playback   # older name, still used by GUI pages
+
+    def play_frames(self, frames: Iterable[Frame], rotation: int = 0,
+                    orientation: str = "landscape", name: str = "lcd-playback") -> None:
+        """Play (image, duration_ms) pairs in real time on the playback thread."""
+
+        def run(stop: threading.Event) -> None:
+            pace_frames(frames, stop, lambda img: self.send_image(img, rotation, orientation))
+
+        self.start_playback(run, name)
 
     def play_gif(self, path: str | Path, loop: bool = True, rotation: int = 0,
-                  orientation: str = "landscape") -> None:
-        """Start playing a GIF in a background thread. Calls stop_gif() before starting a new one."""
-        frames = load_gif_frames(path)
-        self._play_frames(frames, loop, rotation, orientation, "gif-player")
+                 orientation: str = "landscape") -> None:
+        self.play_frames(cycle_frames(load_gif_frames(path), loop), rotation, orientation, "gif-player")
         log.info("GIF playback started: %s", path)
 
     def play_video(self, path: str | Path, loop: bool = True, rotation: int = 0,
-                    orientation: str = "landscape") -> None:
-        """
-        Start playing a video file (mp4/avi/mov/mkv/webm, via OpenCV) in a
-        background thread. Frames are decoded up front (capped at
-        MAX_VIDEO_FRAMES, ~30s), same pattern as play_gif().
-        """
-        frames = load_video_frames(path)
-        self._play_frames(frames, loop, rotation, orientation, "video-player")
+                   orientation: str = "landscape") -> None:
+        """Stream a video (decoded on the fly, downscaled to the panel)."""
+        frames = iter_video_frames(path, max_side=max(self.size), loop=loop)
+        self.play_frames(frames, rotation, orientation, "video-player")
         log.info("Video playback started: %s", path)
 
-    def stop_gif(self) -> None:
-        """Stop GIF or video playback (whichever is running)."""
-        self._stop_gif.set()
-        if self._gif_thread and self._gif_thread.is_alive():
-            self._gif_thread.join(timeout=2.0)
-        self._gif_thread = None
+
+def pace_frames(frames: Iterable[Frame], stop: threading.Event,
+                show: Callable[[Image.Image], None], clock: Callable[[], float] = time.monotonic) -> int:
+    """
+    Show frames on a fixed schedule set by their durations. If sending
+    falls behind (slow encode or link), frames whose time has already
+    passed are skipped rather than burst out late, so playback keeps real
+    time. Returns how many frames were shown.
+    """
+    shown = 0
+    due = clock()
+    for img, duration_ms in frames:
+        if stop.is_set():
+            break
+        step = max(duration_ms, 1) / 1000.0
+        if clock() > due + step:   # this frame's slot is already over: skip it
+            due += step
+            continue
+        show(img)
+        shown += 1
+        due += step
+        delay = due - clock()
+        if delay > 0 and stop.wait(delay):
+            break
+    return shown

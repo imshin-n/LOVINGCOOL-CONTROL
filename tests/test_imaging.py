@@ -60,3 +60,30 @@ def test_portrait_rotates_content_into_native_buffer():
     img.putpixel((0, 0), (255, 255, 255))
     out = orient_for_device(img, 480, 320, "portrait")
     assert out.getpixel((0, 319)) == (255, 255, 255)
+
+
+def test_bgr565_swaps_red_and_blue():
+    from lovingcool_control.core.lcd import image_to_bgr565
+
+    img = Image.new("RGB", (1, 1), (255, 0, 0))
+    assert image_to_bgr565(img) == bytes([0x1F, 0x00])
+
+
+@pytest.mark.parametrize("hint", [None, 1, 20, 55, 90, 100])
+def test_fit_jpeg_hint_gives_same_answer(hint):
+    from lovingcool_control.core.lcd import fit_jpeg
+
+    img = noisy_image(240, 240)
+    best = fit_jpeg(img, 20)
+    assert fit_jpeg(img, 20, hint=hint)[1] == best[1]
+    assert len(best[0]) <= 20 * 1024
+
+
+def test_fit_jpeg_returns_highest_fitting_quality():
+    from lovingcool_control.core.lcd import fit_jpeg
+
+    img = noisy_image(240, 240)
+    data, q = fit_jpeg(img, 20)
+    over = io.BytesIO()
+    img.save(over, format="JPEG", quality=q + 1)
+    assert len(over.getvalue()) > 20 * 1024

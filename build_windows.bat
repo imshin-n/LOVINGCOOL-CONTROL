@@ -37,6 +37,7 @@ uv run pyinstaller ^
     --name lovingcool-control ^
     --clean ^
     --paths src ^
+    --collect-data lovingcool_control ^
     packaging\pyinstaller_entry.py
 if errorlevel 1 (
     echo Build failed.

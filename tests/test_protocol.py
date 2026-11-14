@@ -1,98 +1,81 @@
-"""Command-channel framing and response parsing (core/device.py), no hardware needed."""
+"""Command-channel codec (core/protocol.py): pure functions, no I/O."""
 
 from __future__ import annotations
 
 import json
+import random
 
 import pytest
 
-from lovingcool_control.core import device as dev_mod
-from lovingcool_control.core.device import KNOWN_DEVICES, AIODevice, DeviceError, DeviceSpec
-
-
-class FakeSerial:
-    """Stands in for serial.Serial: records writes, replays a canned response."""
-
-    def __init__(self, response: bytes = b""):
-        self.written = bytearray()
-        self.response = response
-        self.timeout = 0.1
-
-    def write(self, data: bytes) -> int:
-        self.written += data
-        return len(data)
-
-    def flush(self) -> None:
-        pass
-
-    def read(self, n: int) -> bytes:
-        out, self.response = self.response[:n], self.response[n:]
-        return out
-
-    def close(self) -> None:
-        pass
-
-
-def make_device(response: bytes = b"") -> tuple[AIODevice, FakeSerial]:
-    spec = DeviceSpec(name="test", vid=0x33C3, pid=0x7791, transport="serial")
-    d = AIODevice(spec)
-    fake = FakeSerial(response)
-    d._dev = fake
-    d._connected = True
-    return d, fake
-
-
-@pytest.fixture(autouse=True)
-def no_sleep(monkeypatch):
-    monkeypatch.setattr(dev_mod.time, "sleep", lambda _s: None)
+from lovingcool_control.core.protocol import Frame, FrameParser, build_frame
 
 
 def test_frame_without_payload_matches_known_bytes():
     # get_info: 55 AA, len=7 (LE), key=06, checksum = 0x55+0xAA+7+0+6 = 0x010C (LE)
-    assert AIODevice._build_command_frame(0x06) == bytes.fromhex("55aa0700060c01")
+    assert build_frame(0x06) == bytes.fromhex("55aa0700060c01")
 
 
 def test_frame_with_payload_length_and_checksum():
-    frame = AIODevice._build_command_frame(0x03, bytes([80]))
+    frame = build_frame(0x03, bytes([80]))
     assert frame[:2] == b"\x55\xaa"
     assert int.from_bytes(frame[2:4], "little") == len(frame) == 8
     assert frame[4] == 0x03 and frame[5] == 80
     assert int.from_bytes(frame[-2:], "little") == sum(frame[:-2]) & 0xFFFF
 
 
-def test_get_info_parses_json_response():
-    info = {"width": 480, "height": 480, "model": "sc60", "version": "Ver1.0"}
-    body = json.dumps({"data": info}).encode()
-    d, fake = make_device(AIODevice._build_command_frame(0x06, body))
-    assert d.get_info() == info
-    assert bytes(fake.written) == AIODevice._build_command_frame(0x06)
+@pytest.mark.parametrize("key", [-1, 256])
+def test_bad_key_rejected(key):
+    with pytest.raises(ValueError):
+        build_frame(key)
 
 
-def test_non_json_response_is_returned_as_hex():
-    d, _ = make_device(AIODevice._build_command_frame(0x06, b"\xff\xfe"))
-    assert d.send_command(0x06) == {"raw": "fffe"}
+def test_parser_round_trip():
+    body = json.dumps({"data": {"width": 480}}).encode()
+    assert FrameParser().feed(build_frame(0x06, body)) == [Frame(0x06, body)]
 
 
-@pytest.mark.parametrize("response", [b"", b"\x00\x01\x02\x03\x04\x05\x06\x07", b"\x55\xaa\x07"])
-def test_missing_or_garbled_response_raises(response):
-    d, _ = make_device(response)
-    with pytest.raises(DeviceError):
-        d.send_command(0x06)
+def test_parser_handles_any_chunking():
+    stream = build_frame(0x06, b'{"a":1}') + build_frame(0x11) + build_frame(0x03, b"\x50")
+    rng = random.Random(1)
+    for _ in range(50):
+        parser, got, i = FrameParser(), [], 0
+        while i < len(stream):
+            n = rng.randint(1, 6)
+            got += parser.feed(stream[i:i + n])
+            i += n
+        assert [f.key for f in got] == [0x06, 0x11, 0x03]
+        assert parser.pending == 0
 
 
-def test_brightness_is_clamped_and_needs_no_reply():
-    d, fake = make_device()
-    d.set_brightness(150)
-    assert bytes(fake.written) == AIODevice._build_command_frame(0x03, bytes([100]))
+def test_parser_skips_leading_garbage_and_split_sync():
+    parser = FrameParser()
+    assert parser.feed(b"\x00\x13\x37\x55") == []          # trailing 0x55 may start a sync
+    assert parser.feed(build_frame(0x06)[1:]) == [Frame(0x06, b"")]
 
 
-def test_send_when_disconnected_raises():
-    d, _ = make_device()
-    d._connected = False
-    with pytest.raises(DeviceError):
-        d.send_packet(b"x")
+def test_parser_drops_bad_checksum_and_recovers():
+    bad = bytearray(build_frame(0x06, b"xyz"))
+    bad[-1] ^= 0xFF
+    parser = FrameParser()
+    assert parser.feed(bytes(bad) + build_frame(0x11)) == [Frame(0x11, b"")]
+    assert parser.dropped >= 1
 
 
-def test_known_devices_include_7788_and_sc60():
-    ids = {(s.vid, s.pid) for s in KNOWN_DEVICES}
-    assert {(0x33C3, 0x7788), (0x33C3, 0x7791)} <= ids
+def test_parser_drops_impossible_length():
+    parser = FrameParser()
+    assert parser.feed(b"\x55\xaa\x02\x00" + build_frame(0x06)) == [Frame(0x06, b"")]
+
+
+def test_parser_waits_for_incomplete_frame():
+    frame = build_frame(0x06, b"0123456789")
+    parser = FrameParser()
+    assert parser.feed(frame[:-1]) == []
+    assert parser.feed(frame[-1:]) == [Frame(0x06, b"0123456789")]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [(b'{"data":{"w":1}}', {"data": {"w": 1}}), (b"\xff\xfe", {"raw": "fffe"}), (b"[1,2]", {"value": [1, 2]})],
+)
+def test_frame_json(payload, expected):
+    assert Frame(0x06, payload).json() == expected
