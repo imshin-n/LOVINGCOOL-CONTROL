@@ -218,7 +218,10 @@ class Display:
                 },
                 "content": self.state.content.describe() if self.state.content else None,
                 "playing": bool(lcd and lcd.playing),
-                "brightness": self.state.brightness,
+                "brightness": self.state.brightness if self.state.brightness is not None
+                else (dev.info.get("brightness") if dev else None),
+                "path": self.state.content.path if self.state.content else None,
+                "kind": self.state.content.kind if self.state.content else None,
                 "error": errors[0] if errors else (None if dev else self._last_connect_error),
             }
 
@@ -259,6 +262,43 @@ class Display:
             return {"ok": False, "error": f"bad request: {e}"}
 
 
+class ServiceRunner:
+    """
+    The whole service (device monitor + control socket) on background
+    threads. lovingcool-controld runs one in its main thread; the GUI starts
+    one inside itself when no background service is running.
+    """
+
+    def __init__(self, socket_path: Path | None = None, state_path: Path | None = None, poll: float = 2.0,
+                 discover: Callable[[], list[AIODevice]] = find_devices):
+        self.socket_path = socket_path or default_socket_path()
+        self.display = Display(state_path or default_state_path(), discover=discover)
+        self.server = Server(self.socket_path, self.display.handle)   # raises RuntimeError if one is running
+        self.poll = poll
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self.server.start()
+        self._thread = threading.Thread(target=self._monitor, daemon=True, name="device-monitor")
+        self._thread.start()
+
+    def _monitor(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.display.tick()
+            except Exception:
+                log.exception("Monitor error")
+            self._stop.wait(self.poll)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        self.server.stop()
+        self.display.shutdown()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="lovingcool-controld", description="Background service for the cooler's screen.")
     ap.add_argument("--socket", type=Path, default=default_socket_path(), help="control socket path")
@@ -269,30 +309,24 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(name)s: %(message)s")
-    display = Display(args.state)
     try:
-        server = Server(args.socket, display.handle)
+        runner = ServiceRunner(args.socket, args.state, args.poll)
     except RuntimeError as e:
         log.error("%s", e)
         return 1
 
-    stop = threading.Event()
+    stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: stop.set())
+        signal.signal(sig, lambda *_: stopping.set())
 
-    server.start()
+    runner.start()
     log.info("Listening on %s (pid %d); state in %s", args.socket, os.getpid(), args.state)
     try:
-        while not stop.is_set():
-            try:
-                display.tick()
-            except Exception:
-                log.exception("Monitor error")
-            stop.wait(args.poll)
+        while not stopping.wait(1.0):   # timed waits keep signal delivery prompt
+            pass
     finally:
         log.info("Shutting down")
-        server.stop()
-        display.shutdown()
+        runner.stop()
     return 0
 
 

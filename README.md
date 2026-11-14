@@ -3,7 +3,7 @@
 A cross-platform, open-source Python GUI for **Lovi.Cool AIO liquid coolers**
 with an LCD display — built because no official Linux software exists.
 
-Controls: LCD image / GIF / text display, RGB lighting (color, modes, brightness).
+Controls: LCD image / GIF / video / text display and live stat screens, brightness. (RGB lighting is a separate device on this product line; `core/rgb.py` is a stub until one turns up, and the GUI hides it.)
 
 Runs on **Linux, Windows, and macOS** from the same codebase (PyQt6 + hidapi).
 
@@ -240,14 +240,19 @@ lovingcool-control/
 │   ├── canvas.py       # Screen Designer: scene composer + live playback thread
 │   ├── sensors.py        # CPU/GPU/RAM/temp readings for stat widgets
 │   └── rgb.py              # RGB color/mode/brightness control (unverified, see below)
+├── src/lovingcool_control/service/
+│   ├── daemon.py        # lovingcool-controld: owns the device, reconnects, restores state
+│   ├── server.py        # local JSON control socket
+│   └── state.py         # what to show, persisted across restarts
+├── src/lovingcool_control/cli.py   # lovingcool-ctl
 ├── src/lovingcool_control/gui/
-│   ├── app.py           # Main window, run this to launch the GUI
-│   ├── theme.py          # Dark UI stylesheet
+│   ├── app.py           # Main window (lovingcool-control)
+│   ├── bridge.py        # GUI -> service requests (starts a built-in service if none runs)
+│   ├── theme.py         # Dark UI stylesheet
 │   └── pages/
-│       ├── device_page.py       # Connect/discover devices
-│       ├── lcd_page.py            # Simple single-shot LCD editor
-│       ├── screen_designer.py       # Customizable live screen builder
-│       └── rgb_page.py                # RGB editor
+│       ├── status_page.py   # Connection, what's showing, brightness, unknown USB devices
+│       ├── lcd_page.py      # Show an image / GIF / video / text
+│       └── designer/        # Screen Designer (page, preview, widget dialog)
 ├── tools/
 │   ├── enumerate.py   # Step 1: find your AIO's VID:PID
 │   └── sniffer.py       # Step 2: capture USB protocol bytes
@@ -415,15 +420,24 @@ pickers, presets — already works and doesn't need changes.
 uv run lovingcool-control        # or: uv run python -m lovingcool_control
 ```
 
-1. **Device tab**: click Connect once your device appears in "Recognized Devices"
-2. **LCD Display tab**: pick an image/GIF/video or enter text, hit "Send to LCD" — the simple, single-shot path
-   (video via `opencv-python-headless`, streamed frame by frame like GIF playback through
-   `LCDController.play_frames()`; see `core/lcd.py`). Only one thing plays at a time: starting a GIF,
-   video or live scene anywhere replaces whatever was playing. Has its own Landscape/Portrait toggle,
-   same underlying `logical_canvas_size()`/`orient_for_device()` as Screen Designer (see below) —
-   orientation isn't a Screen-Designer-only feature, both editing screens share it from `core/lcd.py`.
-3. **Screen Designer tab**: build a live, multi-layer screen (see below)
-4. **RGB Lighting tab**: pick a color/mode, hit "Apply"
+The GUI never opens the device itself: it sends requests to the
+service. If the background service is installed it talks to that, and
+whatever you show keeps running after you close the window. If not, it
+starts the same service inside itself (that's how it works on Windows and
+macOS too); then the screen stops when the window closes.
+
+1. **Status**: is the cooler connected, what's showing, brightness, and a
+   list of unrecognised USB devices to help add a new model.
+2. **LCD Display**: pick an image/GIF/video or type text (with colours and
+   size), hit "Send to LCD". "Stop / Clear" turns the screen off. Your last
+   choices are remembered.
+3. **Screen Designer**: build a live, multi-layer screen (see below).
+   "Start Live" hands it to the service; edits you make while live appear
+   on the screen within about half a second. Your work in progress is
+   autosaved and reopened next time.
+
+Only one thing plays at a time: showing something from any page, the CLI
+or a script replaces whatever was playing.
 
 ---
 
@@ -608,11 +622,9 @@ Under the hood that's newline-delimited JSON on a user-only Unix socket
 (`$XDG_RUNTIME_DIR/lovingcool-control.sock`), e.g.
 `{"cmd": "show", "path": "/home/me/cat.gif"}`, so anything can drive it.
 
-Only one program can hold the serial port, so while the service runs the
-GUI can't connect to the device directly (it tells you so). Stop the
-service first (`systemctl --user stop lovingcool-control`) to use the GUI's
-LCD page or Screen Designer live mode; making the GUI a client of the
-service is the next step.
+The GUI (`lovingcool-control`) is just another client of the service, so
+you can use it, `lovingcool-ctl` and scripts side by side. Scenes saved
+from the Screen Designer go to `~/.config/lovingcool-control/scenes/`.
 
 ```bash
 systemctl --user restart lovingcool-control

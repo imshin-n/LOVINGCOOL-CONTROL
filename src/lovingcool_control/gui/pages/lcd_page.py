@@ -1,7 +1,9 @@
 """
 lovingcool-control :: gui/pages/lcd_page.py
 ====================================
-LCD display editor page — image, GIF, and text → device.
+Simple LCD page: show an image, GIF, video or a line of text. Everything
+goes through the service (gui/bridge.py), which keeps showing it after this
+window closes when the background service is installed.
 """
 
 from __future__ import annotations
@@ -9,7 +11,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QColorDialog,
@@ -20,18 +22,19 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from lovingcool_control.core.lcd import (
     VIDEO_EXTENSIONS,
-    LCDController,
     load_image,
     load_video_thumbnail,
     logical_canvas_size,
     render_text_image,
 )
+from lovingcool_control.gui.bridge import ServiceBridge
 
 log = logging.getLogger(__name__)
 
@@ -70,19 +73,16 @@ class LCDPreview(QLabel):
 class LCDPage(QWidget):
     log_message = pyqtSignal(str)
 
-    def __init__(self, get_device_callback):
+    def __init__(self, bridge: ServiceBridge):
         super().__init__()
-        self._get_device = get_device_callback  # callable returning AIODevice | None
-        self._lcd_controller: LCDController | None = None
+        self.bridge = bridge
+        self._settings = QSettings("lovingcool-control", "lovingcool-control")
         self._current_image_path: str | None = None
         self._orientation = "landscape"
         self._build_ui()
+        self._restore_settings()
         self._update_dimensions_label()
-
-        self._size_timer = QTimer(self)
-        self._size_timer.setInterval(1000)
-        self._size_timer.timeout.connect(self._update_dimensions_label)
-        self._size_timer.start()
+        bridge.status_changed.connect(lambda _st: self._update_dimensions_label())
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -181,6 +181,13 @@ class LCDPage(QWidget):
         self.bg_color_btn.setVisible(False)
         text_color_row.addWidget(self.fg_color_btn)
         text_color_row.addWidget(self.bg_color_btn)
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(8, 300)
+        self.font_size_spin.setValue(40)
+        self.font_size_spin.setSuffix(" px")
+        self.font_size_spin.setVisible(False)
+        self.font_size_spin.valueChanged.connect(self._update_text_preview)
+        text_color_row.addWidget(self.font_size_spin)
         controls_layout.addLayout(text_color_row)
 
         # Orientation
@@ -252,13 +259,15 @@ class LCDPage(QWidget):
         self.text_field.setVisible(not is_image)
         self.fg_color_btn.setVisible(not is_image)
         self.bg_color_btn.setVisible(not is_image)
+        self.font_size_spin.setVisible(not is_image)
+        if not is_image:
+            self._update_text_preview()
+        elif self._current_image_path:
+            self._show_file_preview(self._current_image_path)
 
     def _device_native_size(self) -> tuple[int, int]:
-        """The LCD panel's fixed physical raster, auto-detected from the connected device."""
-        device = self._get_device()
-        if device and device.connected:
-            return device.panel_size
-        return 240, 240
+        """The panel's native raster, as reported by the service (or the last one seen)."""
+        return self.bridge.panel_size()
 
     def _canvas_size(self) -> tuple[int, int]:
         """The current LOGICAL/oriented canvas size (swapped in Portrait)."""
@@ -287,8 +296,7 @@ class LCDPage(QWidget):
 
     def _update_dimensions_label(self):
         w, h = self._canvas_size()
-        device = self._get_device()
-        suffix = "" if (device and device.connected) else " (default — connect device for actual size)"
+        suffix = "" if self.bridge.connected else " (last known; device not connected)"
         self.dimensions_label.setText(f"{w} × {h} px{suffix}")
 
     def _browse_file(self):
@@ -298,17 +306,21 @@ class LCDPage(QWidget):
             "Media (*.png *.jpg *.jpeg *.gif *.bmp *.mp4 *.avi *.mov *.mkv *.webm)"
         )
         if path:
-            self._current_image_path = path
-            self.file_path_field.setText(Path(path).name)
-            self._update_dimensions_label()
-            try:
-                if path.lower().endswith(VIDEO_EXTENSIONS):
-                    img = load_video_thumbnail(path)
-                else:
-                    img = load_image(path)
-                self.preview.set_image(img)
-            except Exception as e:
-                self.log_message.emit(f"[ERROR] Could not preview: {e}")
+            self._set_file(path)
+
+    def _set_file(self, path: str) -> None:
+        self._current_image_path = path
+        self.file_path_field.setText(Path(path).name)
+        self.file_path_field.setToolTip(path)
+        self._update_dimensions_label()
+        self._show_file_preview(path)
+
+    def _show_file_preview(self, path: str) -> None:
+        try:
+            img = load_video_thumbnail(path) if path.lower().endswith(VIDEO_EXTENSIONS) else load_image(path)
+            self.preview.set_image(img)
+        except Exception as e:
+            self.log_message.emit(f"[ERROR] Could not preview: {e}")
 
     def _pick_fg_color(self):
         color = QColorDialog.getColor(self._fg_color, self, "Text Color")
@@ -330,66 +342,91 @@ class LCDPage(QWidget):
         fg = (self._fg_color.red(), self._fg_color.green(), self._fg_color.blue())
         bg = (self._bg_color.red(), self._bg_color.green(), self._bg_color.blue())
         w, h = self._canvas_size()
-        img = render_text_image(text, w, h, font_size=40, fg_color=fg, bg_color=bg)
+        img = render_text_image(text, w, h, font_size=self.font_size_spin.value(), fg_color=fg, bg_color=bg)
         self.preview.set_image(img)
 
     def _get_rotation(self) -> int:
         return int(self.rotation_combo.currentText().rstrip("°"))
 
-    # ── Device actions ────────────────────────────────────────
-
-    def _ensure_controller(self) -> LCDController | None:
-        device = self._get_device()
-        if not device or not device.connected:
-            self.log_message.emit("[ERROR] No device connected. Connect your AIO first.")
-            return None
-        self._lcd_controller = LCDController.for_device(device)
-        try:
-            self._lcd_controller.ensure_info()
-        except Exception as e:
-            self.log_message.emit(f"[WARN] Could not read device info, using defaults: {e}")
-        return self._lcd_controller
+    # ── Device actions (all through the service) ─────────────
 
     def _send_to_device(self):
-        controller = self._ensure_controller()
-        if not controller:
-            return
-        controller.stop_playback()   # a still image/text replaces any GIF, video or live scene
-
+        self._save_settings()
         rotation = self._get_rotation()
-
         if self.btn_image.isChecked():
             if not self._current_image_path:
                 self.log_message.emit("[ERROR] No image/GIF/video selected.")
                 return
             path = self._current_image_path
-            loop = self.loop_combo.currentText() == "Loop forever"
-            try:
-                if path.lower().endswith(VIDEO_EXTENSIONS):
-                    controller.play_video(path, loop=loop, rotation=rotation, orientation=self._orientation)
-                    self.log_message.emit(f"[OK] Playing video: {Path(path).name}")
-                elif path.lower().endswith(".gif"):
-                    controller.play_gif(path, loop=loop, rotation=rotation, orientation=self._orientation)
-                    self.log_message.emit(f"[OK] Playing GIF: {Path(path).name}")
-                else:
-                    controller.send_image_file(path, rotation=rotation, orientation=self._orientation)
-                    self.log_message.emit(f"[OK] Sent image: {Path(path).name}")
-            except Exception as e:
-                self.log_message.emit(f"[ERROR] Failed to send: {e}")
+            req = {"cmd": "show", "path": path, "loop": self.loop_combo.currentIndex() == 0,
+                   "rotation": rotation, "orientation": self._orientation}
+            label = Path(path).name
         else:
             text = self.text_field.text()
             if not text:
                 self.log_message.emit("[ERROR] Enter some text first.")
                 return
-            fg = (self._fg_color.red(), self._fg_color.green(), self._fg_color.blue())
-            bg = (self._bg_color.red(), self._bg_color.green(), self._bg_color.blue())
-            try:
-                controller.send_text(text, fg=fg, bg=bg, orientation=self._orientation)
-                self.log_message.emit(f"[OK] Sent text: \"{text}\"")
-            except Exception as e:
-                self.log_message.emit(f"[ERROR] Failed to send text: {e}")
+            req = {"cmd": "text", "text": text, "font_size": self.font_size_spin.value(),
+                   "fg": list(self._fg_color.getRgb()[:3]), "bg": list(self._bg_color.getRgb()[:3]),
+                   "orientation": self._orientation}
+            label = f'"{text}"'
+        self.send_btn.setEnabled(False)
+
+        def done(reply: dict) -> None:
+            self.send_btn.setEnabled(True)
+            if reply.get("ok"):
+                if reply.get("applied"):
+                    self.log_message.emit(f"[OK] Showing {label}")
+                else:
+                    self.log_message.emit(f"[INFO] Saved {label}; it will show when the cooler connects")
+                self.bridge.refresh()
+
+        self.bridge.call(req, done)
 
     def _stop_display(self):
-        if self._lcd_controller:
-            self._lcd_controller.stop_gif()
-            self.log_message.emit("[OK] Stopped playback")
+        def done(reply: dict) -> None:
+            if reply.get("ok"):
+                self.log_message.emit("[OK] Screen off")
+                self.bridge.refresh()
+
+        self.bridge.call({"cmd": "off"}, done)
+
+    # ── Settings ──────────────────────────────────────────────
+
+    def _restore_settings(self) -> None:
+        st = self._settings
+        st.beginGroup("lcd_page")
+        try:
+            path = st.value("file", "")
+            if path and Path(path).is_file():
+                self._set_file(path)
+            self.loop_combo.setCurrentIndex(int(st.value("loop_index", 0)))
+            self.text_field.setText(st.value("text", ""))
+            self.font_size_spin.setValue(int(st.value("font_size", 40)))
+            self._fg_color = QColor(st.value("fg", "#ffffff"))
+            self._bg_color = QColor(st.value("bg", "#000000"))
+            self.rotation_combo.setCurrentIndex(int(st.value("rotation_index", 0)))
+            self._set_orientation(st.value("orientation", "landscape"))
+            self._switch_source(st.value("source", "image"))
+        except (TypeError, ValueError):
+            pass
+        finally:
+            st.endGroup()
+
+    def _save_settings(self) -> None:
+        st = self._settings
+        st.beginGroup("lcd_page")
+        st.setValue("file", self._current_image_path or "")
+        st.setValue("loop_index", self.loop_combo.currentIndex())
+        st.setValue("text", self.text_field.text())
+        st.setValue("font_size", self.font_size_spin.value())
+        st.setValue("fg", self._fg_color.name())
+        st.setValue("bg", self._bg_color.name())
+        st.setValue("rotation_index", self.rotation_combo.currentIndex())
+        st.setValue("orientation", self._orientation)
+        st.setValue("source", "image" if self.btn_image.isChecked() else "text")
+        st.endGroup()
+
+    def hideEvent(self, event):
+        self._save_settings()
+        super().hideEvent(event)

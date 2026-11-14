@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -24,26 +25,24 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from lovingcool_control.core.lcd import LCDController
-from lovingcool_control.gui.pages.device_page import DevicePage
+from lovingcool_control.gui.bridge import MODE_EMBEDDED, MODE_NONE, ServiceBridge
+from lovingcool_control.gui.pages.designer import ScreenDesignerPage
 from lovingcool_control.gui.pages.lcd_page import LCDPage
-from lovingcool_control.gui.pages.protocol_lab import ProtocolLabPage
-from lovingcool_control.gui.pages.rgb_page import RGBPage
-from lovingcool_control.gui.pages.screen_designer import ScreenDesignerPage
-from lovingcool_control.gui.theme import DANGER, STYLESHEET, SUCCESS
+from lovingcool_control.gui.pages.status_page import StatusPage
+from lovingcool_control.gui.theme import ACCENT_AMBER, DANGER, STYLESHEET, SUCCESS
 from lovingcool_control.gui.widgets.log_console import LogConsole
 
 log = logging.getLogger("lovingcool-control")
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, bridge: ServiceBridge | None = None):
         super().__init__()
         self.setWindowTitle("LOVINGCOOL-CONTROL — AIO screen controller")
         self.resize(1150, 760)
         self.setMinimumSize(900, 620)
-
-        self._current_device = None
+        self._settings = QSettings("lovingcool-control", "lovingcool-control")
+        self.bridge = bridge or ServiceBridge()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -76,11 +75,9 @@ class MainWindow(QMainWindow):
         self.nav_buttons: dict[str, QPushButton] = {}
 
         nav_items = [
-            ("device",   "⬡  Device"),
+            ("status",   "⬡  Status"),
             ("lcd",      "▣  LCD Display"),
             ("screen",   "🖥  Screen Designer"),
-            ("rgb",      "◐  RGB Lighting"),
-            ("protocol", "⌬  Protocol Lab"),
         ]
         for key, label in nav_items:
             btn = QPushButton(label)
@@ -102,7 +99,8 @@ class MainWindow(QMainWindow):
         self.status_dot = QLabel("●")
         self.status_dot.setObjectName("statusDot")
         self.status_dot.setStyleSheet(f"color: {DANGER};")
-        self.status_label = QLabel("Disconnected")
+        self.status_label = QLabel("Starting…")
+        self.status_label.setWordWrap(True)
         self.status_label.setObjectName("statusText")
         status_row.addWidget(self.status_dot)
         status_row.addWidget(self.status_label)
@@ -114,18 +112,14 @@ class MainWindow(QMainWindow):
 
         # Page stack
         self.stack = QStackedWidget()
-        self.device_page = DevicePage()
-        self.lcd_page = LCDPage(self.get_current_device)
-        self.screen_page = ScreenDesignerPage(self.get_current_device)
-        self.rgb_page = RGBPage(self.get_current_device)
-        self.protocol_page = ProtocolLabPage(self.get_current_device)
+        self.status_page = StatusPage(self.bridge)
+        self.lcd_page = LCDPage(self.bridge)
+        self.screen_page = ScreenDesignerPage(self.bridge)
 
         self.pages = {
-            "device":   self.device_page,
-            "lcd":      self.lcd_page,
-            "screen":   self.screen_page,
-            "rgb":      self.rgb_page,
-            "protocol": self.protocol_page,
+            "status": self.status_page,
+            "lcd":    self.lcd_page,
+            "screen": self.screen_page,
         }
         for page in self.pages.values():
             self.stack.addWidget(page)
@@ -141,50 +135,50 @@ class MainWindow(QMainWindow):
         # ── Wire navigation ──────────────────────────────────
         for key, btn in self.nav_buttons.items():
             btn.clicked.connect(lambda checked, k=key: self._switch_page(k))
-        self.nav_buttons["device"].setChecked(True)
-        self.stack.setCurrentWidget(self.device_page)
-
-        self.device_page.device_connected.connect(self._on_device_connected)
-        self.device_page.device_disconnected.connect(self._on_device_disconnected)
+        last = self._settings.value("window/page", "status")
+        self._switch_page(last if last in self.pages else "status")
+        geometry = self._settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
 
         for page in self.pages.values():
-            if hasattr(page, "log_message"):
-                page.log_message.connect(self._log)
+            page.log_message.connect(self._log)
+        self.bridge.log_message.connect(self._log)
+        self.bridge.status_changed.connect(self._on_status)
 
         self.setStyleSheet(STYLESHEET)
+        self.bridge.start()
 
     # ── Navigation ───────────────────────────────────────────
 
     def _switch_page(self, key: str):
+        self.nav_buttons[key].setChecked(True)
         self.stack.setCurrentWidget(self.pages[key])
 
-    def get_current_device(self):
-        return self._current_device
-
-    def _on_device_connected(self, device):
-        self._current_device = device
-        self.status_dot.setStyleSheet(f"color: {SUCCESS};")
-        self.status_label.setText(device.spec.name)
-        self._log(f"[OK] Connected: {device.spec.name} (0x{device.spec.vid:04X}:0x{device.spec.pid:04X})")
-
-    def _on_device_disconnected(self):
-        self._current_device = None
-        self.status_dot.setStyleSheet(f"color: {DANGER};")
-        self.status_label.setText("Disconnected")
-        self._log("[INFO] Device disconnected")
+    def _on_status(self, st: dict):
+        dev = st.get("device") if st.get("connected") else None
+        if self.bridge.mode == MODE_NONE:
+            color, text = DANGER, "No service"
+        elif dev:
+            color, text = SUCCESS, dev["name"]
+        else:
+            color, text = ACCENT_AMBER, "Waiting for cooler…"
+        if self.bridge.mode == MODE_EMBEDDED:
+            text += "\n(built-in service)"
+        self.status_dot.setStyleSheet(f"color: {color};")
+        self.status_label.setText(text)
 
     def _log(self, message: str):
         self.log_console.append(message)
         log.info(message)
 
     def closeEvent(self, event):
-        if self._current_device:
-            LCDController.for_device(self._current_device).stop_playback()
-            try:
-                LCDController.for_device(self._current_device).stop()   # end the stream cleanly
-            except Exception:
-                pass
-            self._current_device.disconnect()
+        current = next((k for k, page in self.pages.items() if page is self.stack.currentWidget()), "status")
+        self._settings.setValue("window/page", current)
+        self._settings.setValue("window/geometry", self.saveGeometry())
+        self.lcd_page._save_settings()
+        # With the background service the screen keeps going; a built-in one stops here.
+        self.bridge.shutdown()
         event.accept()
 
 
